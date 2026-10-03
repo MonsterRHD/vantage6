@@ -778,15 +778,45 @@ class TestResources(TestResourceBase):
 
         kill_task(parent_task, socket)
 
+        # The kill instruction is emitted exactly once and carries an event id and
+        # timestamp so that nodes can deduplicate and order deliveries.
+        kill_emits = [
+            call
+            for call in socket.emit.call_args_list
+            if call.args[0] == "kill_containers"
+        ]
+        self.assertEqual(len(kill_emits), 1)
+        kill_payload = kill_emits[0].args[1]
+        self.assertIn("event_id", kill_payload)
+        self.assertTrue(kill_payload["event_id"])
+        self.assertIn("issued_at", kill_payload)
+
         # The emitted kill payload should contain every unfinished parent/child
         # run
-        emit_args = socket.emit.call_args.args
-        kill_list = emit_args[1]["kill_list"]
+        kill_list = kill_payload["kill_list"]
         self.assertEqual(len(kill_list), 3)
         self.assertCountEqual(
             [entry["run_id"] for entry in kill_list],
             [parent_run.id, child_run_1.id, child_run_2.id],
         )
+
+        # HQ broadcasts the terminal KILLED state itself once per run (both a
+        # status_update and an algorithm_status_change), so the outcome does not
+        # depend on a node acknowledgement and late callbacks cannot resurrect
+        # the task.
+        killed_broadcasts = [
+            call
+            for call in socket.emit.call_args_list
+            if call.args[0] == "algorithm_status_change"
+            and call.args[1]["status"] == RunStatus.KILLED.value
+        ]
+        self.assertEqual(len(killed_broadcasts), 3)
+        status_updates = [
+            call
+            for call in socket.emit.call_args_list
+            if call.args[0] == "status_update"
+        ]
+        self.assertEqual(len(status_updates), 3)
 
         # Killed runs use RunStatus.KILLED; task.status aggregates to FAILED (kill is a
         # failed-type run status per RunStatus.has_failed).

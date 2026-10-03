@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import uuid
 from http import HTTPStatus
 from socket import SocketIO
 
@@ -280,7 +281,12 @@ class KillNodeTasks(ServicesResources):
 
         self.socketio.emit(
             "kill_containers",
-            {"node_id": node.id, "collaboration_id": node.collaboration_id},
+            {
+                "node_id": node.id,
+                "collaboration_id": node.collaboration_id,
+                "event_id": str(uuid.uuid4()),
+                "issued_at": dt.datetime.now(dt.UTC).isoformat(),
+            },
             namespace="/tasks",
             room=f"collaboration_{node.collaboration_id}",
         )
@@ -314,15 +320,24 @@ def kill_task(task: db.Task, socket: SocketIO) -> None:
         if not RunStatus.has_finished(run.status)
     ]
 
-    # emit socket event to the node to execute the container kills
+    # emit socket event to the node to execute the container kills. The event id and
+    # timestamp let nodes drop duplicate or out-of-order deliveries.
     socket.emit(
         "kill_containers",
-        {"kill_list": kill_list, "collaboration_id": task.collaboration.id},
+        {
+            "kill_list": kill_list,
+            "collaboration_id": task.collaboration.id,
+            "event_id": str(uuid.uuid4()),
+            "issued_at": dt.datetime.now(dt.UTC).isoformat(),
+        },
         namespace="/tasks",
-        room=f"collaboration_{task.collaboration_id}",
+        room=f"collaboration_{task.collaboration.id}",
     )
 
-    # set tasks and subtasks status to killed
+    # set tasks and subtasks status to killed and broadcast the terminal state.
+    # HQ owns the KILLED terminal state: broadcasting it here means the outcome is
+    # the same whether the node acknowledges promptly, is offline, or its ack is
+    # delayed - and late node callbacks can never resurrect the task.
     def set_killed(task: db.Task):
         for run in task.runs:
             if RunStatus.has_finished(run.status):
@@ -330,7 +345,36 @@ def kill_task(task: db.Task, socket: SocketIO) -> None:
             run.status = RunStatus.KILLED.value
             run.finished_at = dt.datetime.now(dt.UTC)
             run.save()
+            _broadcast_run_killed(socket, run, task)
 
     set_killed(task)
     for subtask in task.children:
         set_killed(subtask)
+
+
+def _broadcast_run_killed(socket: SocketIO, run: db.Run, task: db.Task) -> None:
+    """Emit the terminal KILLED status for one run to its collaboration room."""
+    room = f"collaboration_{task.collaboration_id}"
+    try:
+        node_id = run.node.id if run.node else None
+    except Exception:  # noqa: BLE001 - misconfigured nodes must not break the kill
+        log.warning(
+            "Could not resolve the node of run %s for the kill broadcast", run.id
+        )
+        node_id = None
+    socket.emit("status_update", {"run_id": run.id}, namespace="/tasks", room=room)
+    socket.emit(
+        "algorithm_status_change",
+        {
+            "run_id": run.id,
+            "status": RunStatus.KILLED.value,
+            "task_id": task.id,
+            "job_id": task.job_id,
+            "collaboration_id": task.collaboration_id,
+            "node_id": node_id,
+            "organization_id": run.organization_id,
+            "parent_id": task.parent_id,
+        },
+        namespace="/tasks",
+        room=room,
+    )

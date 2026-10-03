@@ -22,6 +22,7 @@ from vantage6.common.docker.addons import (
 )
 from vantage6.common.enum import AlgorithmStepType, RunStatus, TaskDatabaseType
 from vantage6.common.globals import (
+    APPNAME,
     DATAFRAME_BETWEEN_GROUPS_SEPARATOR,
     DATAFRAME_WITHIN_GROUP_SEPARATOR,
     DEFAULT_ALPINE_IMAGE,
@@ -34,11 +35,15 @@ from vantage6.common.globals import (
 from vantage6.common.kubernetes.utils import database_env_label
 
 from vantage6.cli.context.node import NodeContext
-from vantage6.cli.node.common.task_cleanup import delete_run_related_pods
+from vantage6.cli.node.common.task_cleanup import (
+    ResourceDeletionResult,
+    delete_run_generation_resources,
+)
 from vantage6.cli.utils_kubernetes import replace_localhost_for_k8s
 
 from vantage6.node.enum import KillInitiator
 from vantage6.node.globals import (
+    CLEANUP_RETRY_INTERVAL_SECONDS,
     DATABASE_BASE_PATH,
     DEFAULT_PROXY_PORT,
     ENV_VARS_NOT_SETTABLE_BY_NODE,
@@ -58,7 +63,24 @@ from vantage6.node.k8s.jobpod_state_to_run_status_mapper import (
 )
 from vantage6.node.k8s.network_isolation import validate_algorithm_isolation
 from vantage6.node.k8s.run_io import RunIO
+from vantage6.node.k8s.run_registry import (
+    ACTIVE_STATE_KILLING,
+    CLEANUP_REASON_COMPLETED,
+    CLEANUP_REASON_KILLED,
+    CLEANUP_REASON_RECONCILE,
+    CLEANUP_REASON_SHUTDOWN,
+    ActiveRun,
+    CleanupRecord,
+    RunRegistry,
+)
 from vantage6.node.util import get_parent_id
+
+# Label/annotation keys identifying the run generation owning a Kubernetes object.
+LABEL_RUN_ID = "run_id"
+LABEL_ATTEMPT_TAG = "attempt_tag"
+LABEL_NODE_ID = "node_id"
+ANN_ATTEMPT_TAG = "attempt_tag"
+ANN_DOCKER_LOGIN_SECRET = "docker_login_secret_name"
 
 
 class ContainerManager:
@@ -104,9 +126,19 @@ class ContainerManager:
         self.task_namespace = self.ctx.config["task_namespace"]
 
         # labels to identify the task jobs of this node
-        self.task_job_labels = {"node_id": self.ctx.identifier}
+        self.task_job_labels = {LABEL_NODE_ID: self.ctx.identifier}
         self.task_job_label_selector = ",".join(
             [f"{k}={v}" for k, v in self.task_job_labels.items()]
+        )
+
+        # Persistent registry of run generations and pending cleanups. Survives
+        # node restarts so that retried or delayed cleanup never removes a newer
+        # generation.
+        self._task_dir_extension = self.ctx.config.get("dev", {}).get(
+            "task_dir_extension"
+        )
+        self.registry = RunRegistry(
+            self.host_data_dir, task_dir_extension=self._task_dir_extension
         )
 
         # whether to share or not algorithm logs with HQ
@@ -115,6 +147,8 @@ class ContainerManager:
         self.share_algorithm_logs = self.ctx.config.get("share_algorithm_logs", True)
         if self.share_algorithm_logs:
             self.log.warning("Algorithm logs and errors will be shared with HQ.")
+
+        self._start_cleanup_reconciler()
 
     def set_socket(self, socket_io: SocketIO) -> None:
         """
@@ -404,15 +438,6 @@ class ContainerManager:
         # know the dataframe that is being created or modified by the algorithm.
         df_details = task_info.get("dataframe", {})
 
-        run_io = RunIO(
-            run_id,
-            session_id,
-            action,
-            self.client,
-            df_details,
-            task_dir_extension=self.ctx.config.get("dev", {}).get("task_dir_extension"),
-        )
-
         # Verify that an allowed image is used
         if not self.is_image_allowed(image, task_info):
             self.log.critical(
@@ -424,8 +449,9 @@ class ContainerManager:
             )
             return RunStatus.NOT_ALLOWED
 
-        # Check that this task is not already running
-        if self.is_running(run_io.container_name):
+        # Check that this task is not already running, in any (older or newer)
+        # generation
+        if self.is_run_active(run_id):
             self.log.warning(
                 "[Algorithm run %s requested by org %s] Task is already being "
                 "executed, discarding task",
@@ -433,6 +459,21 @@ class ContainerManager:
                 init_org_id,
             )
             return RunStatus.ACTIVE
+
+        # Each execution attempt gets its own generation tag. Resources are named
+        # and labelled with it, so a delayed cleanup of an old generation can never
+        # remove resources of a newer one.
+        attempt_tag = self.registry.next_attempt_tag()
+
+        run_io = RunIO(
+            run_id,
+            session_id,
+            action,
+            self.client,
+            df_details,
+            task_dir_extension=self._task_dir_extension,
+            attempt_tag=attempt_tag,
+        )
 
         task_id = task_info["id"]
         parent_task_id = get_parent_id(task_info)
@@ -536,7 +577,7 @@ class ContainerManager:
         docker_login_secret = None
         if priv_regs := self.ctx.config.get("private_docker_registries"):
             docker_login_secret = self._create_docker_login_secret(
-                priv_regs, image, run_io.run_id
+                priv_regs, image, run_io.docker_login_secret_name
             )
 
         container = k8s_client.V1Container(
@@ -559,6 +600,11 @@ class ContainerManager:
             ),
         )
 
+        task_job_labels = {
+            **self.task_job_labels,
+            LABEL_RUN_ID: str(run_io.run_id),
+            LABEL_ATTEMPT_TAG: attempt_tag,
+        }
         task_job_metadata = k8s_client.V1ObjectMeta(
             name=run_io.container_name,
             annotations={
@@ -571,8 +617,10 @@ class ContainerManager:
                 "df_name": df_details.get("name") if df_details else "",
                 "df_id": str(df_details.get("id")) if df_details else "",
                 "df_label": df_details.get("label") if df_details else "",
+                ANN_ATTEMPT_TAG: attempt_tag,
+                ANN_DOCKER_LOGIN_SECRET: (run_io.docker_login_secret_name),
             },
-            labels=self.task_job_labels,
+            labels=task_job_labels,
         )
 
         image_pull_secrets = None
@@ -591,7 +639,11 @@ class ContainerManager:
             spec=k8s_client.V1JobSpec(
                 template=k8s_client.V1PodTemplateSpec(
                     metadata=k8s_client.V1ObjectMeta(
-                        labels={"app": run_io.container_name, "role": action}
+                        labels={
+                            **task_job_labels,
+                            "app": run_io.container_name,
+                            "role": action,
+                        }
                     ),
                     spec=k8s_client.V1PodSpec(
                         containers=[container],
@@ -606,13 +658,46 @@ class ContainerManager:
 
         self.log.info(
             "[Algorithm run %s requested by org %s] Creating namespaced K8S job for"
-            " task_id=%s.",
+            " task_id=%s (attempt=%s).",
             run_id,
             init_org_id,
             task_id,
+            attempt_tag,
         )
-        self.batch_api.create_namespaced_job(
-            namespace=self.task_namespace, body=task_job
+        try:
+            self.batch_api.create_namespaced_job(
+                namespace=self.task_namespace, body=task_job
+            )
+        except Exception:
+            # Make sure no partially created resources of this generation survive a
+            # failed Job creation, then let the caller mark the run as failed.
+            self.log.exception(
+                "Failed to create Job %s for run_id=%s",
+                run_io.container_name,
+                run_id,
+            )
+            self._enqueue_cleanup_from_names(
+                run_id=run_id,
+                attempt_tag=attempt_tag,
+                job_name=run_io.container_name,
+                docker_secret_name=(
+                    docker_login_secret.metadata.name if docker_login_secret else None
+                ),
+                reason=CLEANUP_REASON_RECONCILE,
+            )
+            raise
+
+        # Register this generation only after the Job exists. The registry entry is
+        # the anchor to which kill requests and cleanup tombstones are bound.
+        self.registry.activate(
+            ActiveRun(
+                run_id=run_id,
+                attempt_tag=attempt_tag,
+                job_name=run_io.container_name,
+                task_id=task_id,
+                parent_id=parent_task_id,
+                init_org_id=init_org_id,
+            )
         )
 
         # Kubernetes will automatically retry the job ``backoff_limit`` times. According
@@ -645,7 +730,7 @@ class ContainerManager:
         return status
 
     def _create_docker_login_secret(
-        self, priv_regs: list[dict], image: str, run_id: int
+        self, priv_regs: list[dict], image: str, secret_name: str
     ) -> k8s_client.V1Secret | None:
         """
         Create a Docker login secret.
@@ -666,7 +751,7 @@ class ContainerManager:
 
         secret = k8s_client.V1Secret(
             metadata=k8s_client.V1ObjectMeta(
-                name=f"docker-login-secret-run-id-{run_id}",
+                name=secret_name,
                 namespace=self.task_namespace,
             ),
             type="kubernetes.io/dockerconfigjson",
@@ -1444,25 +1529,46 @@ class ContainerManager:
         # for if this string is in fact a regex.
         return any(c in pattern for c in common_regex_chars)
 
-    def is_running(self, label: str) -> bool:
+    def is_run_active(self, run_id: int) -> bool:
         """
-        Check if a container is already running for a certain run.
+        Check whether any generation of a run currently has pods in the cluster.
+
+        Both generation-labelled resources and legacy resources (created before
+        generation labels existed) are considered.
 
         Parameters
         ----------
-        label: str
-            Label of the container constructed from the `run_id`
+        run_id: int
+            ID of the run
 
         Returns
         -------
         bool
-            Whether or not algorithm container is currently running
+            Whether an algorithm run is currently active for this run id
         """
-        pods = self.core_api.list_namespaced_pod(
-            namespace=self.task_namespace,
-            label_selector=f"app={label}",
-        )
-        return bool(pods.items)
+        if self.registry.get_active(run_id) is not None:
+            return True
+        try:
+            pods = self.core_api.list_namespaced_pod(
+                namespace=self.task_namespace,
+                label_selector=(
+                    f"{self.task_job_label_selector},{LABEL_RUN_ID}={run_id}"
+                ),
+            )
+            if pods.items:
+                return True
+            # legacy pods only carry the app label
+            legacy_pods = self.core_api.list_namespaced_pod(
+                namespace=self.task_namespace,
+                label_selector=f"app={APPNAME}-run-{run_id}",
+            )
+            return bool(legacy_pods.items)
+        except ApiException:
+            self.log.exception(
+                "Could not determine whether run_id=%s is active", run_id
+            )
+            # fail safe: assume it is active so the run is not started twice
+            return True
 
     def process_next_completed_run(self) -> Result:
         """
@@ -1502,14 +1608,34 @@ class ContainerManager:
             # Check if any of the jobs is completed
             for job in finished_jobs:
                 annotations = job.metadata.annotations
+                job_name = job.metadata.name
                 # Create helper object to process the output of the job
                 run_io = RunIO.from_dict(
                     annotations,
                     self.client,
-                    task_dir_extension=self.ctx.config.get("dev", {}).get(
-                        "task_dir_extension"
-                    ),
+                    task_dir_extension=self._task_dir_extension,
                 )
+
+                # Skip generations whose resources are being (or have been)
+                # cleaned up. In particular, a killed Job often reports as failed
+                # while it is deleted; its outcome must not be reported.
+                if self.registry.get_cleanup(job_name) is not None:
+                    self.log.debug(
+                        "Skipping finished job %s (run_id=%s): cleanup already "
+                        "registered for this generation",
+                        job_name,
+                        run_io.run_id,
+                    )
+                    continue
+                active = self.registry.get_active(run_io.run_id)
+                if active is not None and active.state == ACTIVE_STATE_KILLING:
+                    self.log.debug(
+                        "Skipping finished job %s (run_id=%s): run is being killed",
+                        job_name,
+                        run_io.run_id,
+                    )
+                    continue
+
                 results, status = (
                     run_io.process_output()
                     if job.status.succeeded
@@ -1533,18 +1659,19 @@ class ContainerManager:
                     status=status,
                     parent_id=int(parent_id) if parent_id else None,
                     init_org_id=int(annotations["init_org_id"]),
+                    attempt_tag=run_io.attempt_tag,
                 )
 
                 self.num_active_tasks -= 1
 
-                delete_run_related_pods(
-                    run_id=run_io.run_id,
-                    container_name=run_io.container_name,
-                    namespace=self.task_namespace,
-                    core_api=self.core_api,
-                    batch_api=self.batch_api,
-                )
+                self._enqueue_completed_cleanup(run_io)
                 completed_job = True
+                break
+
+            if not completed_job:
+                # Every finished job belongs to a generation being cleaned up;
+                # wait for new completions instead of re-processing the same list.
+                time.sleep(1)
 
         return result
 
@@ -1650,184 +1777,584 @@ class ContainerManager:
             encoded_environment_variables[key] = _encode(str(val))
         return encoded_environment_variables
 
+    # ------------------------------------------------------------------
+    # cancellation and generation-aware cleanup
+    # ------------------------------------------------------------------
     def cleanup(self) -> None:
         """
-        Cleanup kubernetes resources created by the node
+        Cleanup Kubernetes resources created by the node on shutdown.
+
+        Deletions that cannot be completed now are persisted as cleanup records and
+        retried by the reconciler on the next node start.
         """
-        # kill all running algorithm runs
-        self._kill_algorithm_runs()
+        try:
+            self.kill_for_shutdown()
+            self._process_cleanups()
+        except Exception:
+            self.log.exception("Error while cleaning up on node shutdown")
+
+    def kill_for_shutdown(self) -> list[KilledRun]:
+        """Kill every run generation still present because the node is shutting down."""
+        self.log.warning(
+            "Killing all algorithms running on this node because it is shutting down"
+        )
+        # Shutdown kills are local housekeeping: HQ is not told KILLED so that the
+        # open runs can be re-executed when the node comes back.
+        return self._kill_all_generations(
+            initiator=KillInitiator.NODE_SHUTDOWN,
+            reason=CLEANUP_REASON_SHUTDOWN,
+            report_killed=False,
+        )
 
     def kill_algorithm_runs(
-        self, kill_list: list[ToBeKilled] | None = None
+        self,
+        kill_list: list[ToBeKilled] | None = None,
+        event_id: str | None = None,
+        issued_at: float | None = None,
     ) -> list[KilledRun]:
         """
         Kill algorithm runs currently running on this node.
 
+        Cancellation is bound to the run generations that are current when this
+        instruction is processed. Retried or duplicated cleanup only ever touches
+        the pinned generation's resources, never a newer generation.
+
         Parameters
         ----------
-        kill_list: list[ToBeKilled] (optional)
-            A list of info on tasks that should be killed. If the list
-            is not specified, all running algorithm containers will be killed.
+        kill_list: list[ToBeKilled], optional
+            Runs to kill. If absent, every run on this node is killed.
+        event_id: str, optional
+            Id of the kill event, used to drop duplicate deliveries
+        issued_at: float, optional
+            Unix timestamp of the event, used to drop out-of-order kill-all events
 
         Returns
         -------
         list[KilledRun]
-            List of dictionaries with information on killed tasks
+            Generations that transitioned to KILLED during this call
         """
-        if not kill_list:
-            self.log.warning(
-                "Received instruction to kill all algorithms running on this "
-                "node. Executing that now..."
-            )
+        if not self.registry.note_kill_event(event_id):
+            self.log.warning("Ignoring duplicate kill event %s", event_id)
+            return []
 
-        killed_runs = self._kill_algorithm_runs(kill_list=kill_list)
-
-        if len(killed_runs) > 0:
-            self.log.warning(
-                "Killed the following run ids as instructed via socket: %s",
-                ", ".join([str(r.run_id) for r in killed_runs]),
-            )
-        else:
-            self.log.warning("Instructed to kill tasks but none were running")
-
-        return killed_runs
-
-    def _kill_algorithm_runs(
-        self,
-        kill_list: list[ToBeKilled] | None = None,
-        initiator: KillInitiator = KillInitiator.USER,
-    ) -> list[KilledRun]:
-        """
-        Kill tasks specified by a kill list, if they are currently running on
-        this node
-
-        Parameters
-        ----------
-        kill_list: list[ToBeKilled]
-            A list of info about tasks that should be killed. If not provided, all
-            running algorithms will be killed.
-
-        Returns
-        -------
-        list[KilledRun]
-            List with information on killed tasks
-        """
-
-        # filter the kill list to only include tasks running on this node
         if kill_list:
             kill_list = [
                 to_kill
                 for to_kill in kill_list
                 if to_kill.organization_id == self.client.whoami.organization_id
             ]
-
-        # get all jobs running on this node
-        current_jobs = self.batch_api.list_namespaced_job(
-            self.task_namespace, label_selector=self.task_job_label_selector
-        )
-        if not current_jobs.items:
+            killed_runs: list[KilledRun] = []
+            for run_id in {to_kill.run_id for to_kill in kill_list}:
+                killed_run = self._kill_run_generation(
+                    run_id, KillInitiator.USER, CLEANUP_REASON_KILLED
+                )
+                if killed_run is not None:
+                    killed_runs.append(killed_run)
+            if not killed_runs:
+                self.log.warning(
+                    "Instructed to kill tasks but none were running on this node"
+                )
+        else:
+            if self.registry.is_stale_kill_all(issued_at):
+                self.log.warning(
+                    "Ignoring stale kill-all instruction (issued_at=%s)", issued_at
+                )
+                return []
             self.log.warning(
-                "Received instructions to kill algorithms, but no jobs found running"
-                " on this node",
+                "Received instruction to kill all algorithms running on this "
+                "node. Executing that now..."
             )
-            return []
+            killed_runs = self._kill_all_generations(
+                initiator=KillInitiator.USER,
+                reason=CLEANUP_REASON_KILLED,
+                report_killed=True,
+            )
+            if not killed_runs:
+                self.log.warning(
+                    "Instructed to kill all tasks but none were running on this node"
+                )
 
-        # kill the jobs that should be killed
-        killed_list: list[KilledRun] = []
-        for job in current_jobs.items:
-            if self._task_job_should_be_killed(job, kill_list):
-                killed_run = self._kill_task_job(job, initiator)
-                killed_list.append(killed_run)
+        if killed_runs:
+            self.log.warning(
+                "Killed the following run ids as instructed: %s",
+                ", ".join(str(r.run_id) for r in killed_runs),
+            )
+        return killed_runs
 
-        # log warnings if jobs should be killed but are not found
-        if kill_list:
-            run_ids_killed = [r.run_id for r in killed_list]
-            run_ids_to_kill = [r.run_id for r in kill_list]
-            for run_id in run_ids_to_kill:
-                if run_id not in run_ids_killed:
-                    self.log.warning(
-                        "Received instruction to kill run_id=%s, but it was not found "
-                        "running on this node.",
-                        run_id,
-                    )
+    def _kill_all_generations(
+        self, initiator: KillInitiator, reason: str, report_killed: bool
+    ) -> list[KilledRun]:
+        """Kill every generation owned by this node that is not already cleaning up."""
+        killed_runs: list[KilledRun] = []
+        handled_jobs = set(self.registry.cleanup_job_names())
 
-        return killed_list
+        # generations visible in the cluster
+        for job in self._list_our_jobs():
+            job_name = job.metadata.name
+            if job_name in handled_jobs:
+                continue
+            killed_run = self._kill_job_object(
+                job, initiator=initiator, reason=reason, report_killed=report_killed
+            )
+            if killed_run is not None:
+                killed_runs.append(killed_run)
+            handled_jobs.add(job_name)
 
-    def _task_job_should_be_killed(
-        self, job: k8s_client.V1Job, kill_list: list[ToBeKilled]
-    ) -> bool:
+        # generations the registry knows about but whose Job already disappeared
+        for active in self.registry.list_active():
+            if active.job_name in handled_jobs:
+                continue
+            record = self._record_from_active(active, reason)
+            killed_run = self._finalize_cleanup_record(
+                record, initiator=initiator, report_killed=report_killed
+            )
+            if killed_run is not None:
+                killed_runs.append(killed_run)
+            handled_jobs.add(active.job_name)
+
+        return killed_runs
+
+    def _kill_run_generation(
+        self, run_id: int, initiator: KillInitiator, reason: str
+    ) -> KilledRun | None:
         """
-        Check if a task job should be killed
+        Kill the current generation of one run.
 
-        Parameters
-        ----------
-        job: k8s_client.V1Job
-            Job to check
-        kill_list: list[ToBeKilled]
-            List of tasks to kill
-
-        Returns
-        -------
-        bool:
-            True if the job should be killed, False otherwise
+        Returns a KilledRun exactly when this call transitions a generation to
+        KILLED; repeated instructions for an already handled generation return
+        None so that the terminal status is reported only once.
         """
-        if not kill_list:
-            return True
-        # if kill list is provided, jobs should only be killed if their run_id is in
-        # the list and they are running on this node (i.e. organization_id matches)
-        return any(
-            job.metadata.annotations["run_id"] == str(container_to_kill.run_id)
-            and container_to_kill.organization_id == self.client.whoami.organization_id
-            for container_to_kill in kill_list
-        )
+        active = self.registry.get_active(run_id)
+        if active is not None:
+            if (
+                active.state == ACTIVE_STATE_KILLING
+                or self.registry.get_cleanup(active.job_name) is not None
+            ):
+                self.log.debug(
+                    "Kill of run_id=%s is already in progress for generation %s",
+                    run_id,
+                    active.attempt_tag,
+                )
+                return None
+            job = self._read_job(active.job_name)
+            if job is not None:
+                return self._kill_job_object(
+                    job,
+                    initiator=initiator,
+                    reason=reason,
+                    report_killed=True,
+                )
+            # The Job disappeared but secrets may linger: pin a tombstone anyway.
+            record = self._record_from_active(active, reason)
+            return self._finalize_cleanup_record(
+                record, initiator=initiator, report_killed=True
+            )
 
-    def _kill_task_job(
-        self, job_to_kill: k8s_client.V1Job, initiator: KillInitiator
-    ) -> KilledRun:
+        # The registry does not know this run (lost state, or a legacy generation):
+        # derive the generation from the cluster objects and kill that exact one.
+        jobs = [
+            job
+            for job in self._list_our_jobs()
+            if (job.metadata.annotations or {}).get("run_id") == str(run_id)
+        ]
+        for job in jobs:
+            if self.registry.get_cleanup(job.metadata.name) is not None:
+                continue
+            killed_run = self._kill_job_object(
+                job, initiator=initiator, reason=reason, report_killed=True
+            )
+            if killed_run is not None:
+                return killed_run
+        return None
+
+    def _kill_job_object(
+        self,
+        job_to_kill: k8s_client.V1Job,
+        initiator: KillInitiator,
+        reason: str,
+        report_killed: bool,
+    ) -> KilledRun | None:
         """
-        Kill a job
-
-        Parameters
-        ----------
-        job_to_kill: k8s_client.V1Job
-            Job to kill
-        initiator: KillInitiator
-            Initiator of the kill request
-
-        Returns
-        -------
-        KilledRun:
-            Information on the killed run
+        Write a generation-pinned tombstone for a Job and delete its resources.
         """
-        self.log.info(
-            "Killing for run_id=%s", job_to_kill.metadata.annotations["run_id"]
-        )
+        annotations = job_to_kill.metadata.annotations or {}
         run_io = RunIO.from_dict(
-            job_to_kill.metadata.annotations,
-            self.client,
-            task_dir_extension=self.ctx.config.get("dev", {}).get("task_dir_extension"),
+            annotations, self.client, task_dir_extension=self._task_dir_extension
         )
-        logs = self._get_logs(run_io)
+        if self.registry.get_cleanup(run_io.container_name) is not None:
+            return None
+
+        self.log.info(
+            "Killing run_id=%s attempt=%s (job %s)",
+            run_io.run_id,
+            run_io.attempt_tag or "legacy",
+            run_io.container_name,
+        )
+
+        logs = ""
         if initiator == KillInitiator.USER:
+            logs = self._get_logs(run_io)
             logs += "\n\nAlgorithm was killed by user request."
-        elif initiator == KillInitiator.NODE_SHUTDOWN:
-            logs += "\n\nAlgorithm was killed because the node was shut down."
-        self.num_active_tasks -= 1
-        delete_run_related_pods(
+
+        record = self._record_from_run_io(
+            run_io=run_io,
+            annotations=annotations,
+            reason=reason,
+            logs=logs,
+            deliver_logs=initiator == KillInitiator.USER,
+        )
+        return self._finalize_cleanup_record(
+            record, initiator=initiator, report_killed=report_killed
+        )
+
+    def _finalize_cleanup_record(
+        self,
+        record: CleanupRecord,
+        initiator: KillInitiator,
+        report_killed: bool,
+    ) -> KilledRun | None:
+        """Persist a tombstone, delete its generation now, and deactivate the run."""
+        self.registry.mark_killing(record.run_id)
+        self.registry.add_cleanup(record)
+        self._delete_generation(record)
+        self._decrement_active_tasks()
+        self.registry.deactivate(record.run_id)
+        if report_killed:
+            self.registry.mark_killed_reported(record.job_name)
+            return KilledRun(
+                run_id=record.run_id,
+                task_id=record.task_id,
+                parent_id=record.parent_id,
+                logs=record.logs,
+                attempt_tag=record.attempt_tag,
+            )
+        return None
+
+    def _enqueue_completed_cleanup(self, run_io: RunIO) -> None:
+        """Tombstone a naturally completed generation and delete its resources."""
+        record = self._record_from_run_io(
+            run_io=run_io,
+            annotations={
+                "run_id": str(run_io.run_id),
+                ANN_DOCKER_LOGIN_SECRET: run_io.docker_login_secret_name,
+            },
+            reason=CLEANUP_REASON_COMPLETED,
+            logs="",
+            deliver_logs=False,
+        )
+        self.registry.add_cleanup(record)
+        self.registry.deactivate(run_io.run_id)
+        self._delete_generation(record)
+
+    def _enqueue_cleanup_from_names(
+        self,
+        run_id: int,
+        attempt_tag: str | None,
+        job_name: str,
+        reason: str,
+        docker_secret_name: str | None = None,
+    ) -> None:
+        """Tombstone a generation identified by explicit resource names."""
+        record = CleanupRecord(
+            run_id=run_id,
+            attempt_tag=attempt_tag,
+            job_name=job_name,
+            secret_name=job_name,
+            docker_secret_name=docker_secret_name,
+            reason=reason,
+            logs_delivered=True,
+        )
+        self.registry.add_cleanup(record)
+        self._delete_generation(record)
+
+    def _record_from_run_io(
+        self,
+        run_io: RunIO,
+        annotations: dict,
+        reason: str,
+        logs: str,
+        deliver_logs: bool,
+    ) -> CleanupRecord:
+        docker_secret_name = annotations.get(ANN_DOCKER_LOGIN_SECRET) or None
+        if docker_secret_name is None and run_io.attempt_tag is None:
+            # legacy generations hard-coded this secret name
+            docker_secret_name = self._docker_secret_name(run_io.run_id, None)
+
+        def _int(key: str) -> int | None:
+            value = annotations.get(key)
+            return int(value) if value else None
+
+        return CleanupRecord(
             run_id=run_io.run_id,
-            container_name=run_io.container_name,
+            attempt_tag=run_io.attempt_tag,
+            job_name=run_io.container_name,
+            secret_name=run_io.container_name,
+            docker_secret_name=docker_secret_name,
+            reason=reason,
+            task_id=_int("task_id"),
+            parent_id=_int("task_parent_id"),
+            logs=logs,
+            logs_delivered=not deliver_logs,
+        )
+
+    def _record_from_active(self, active: ActiveRun, reason: str) -> CleanupRecord:
+        """Build a tombstone for a generation known from the registry."""
+        return CleanupRecord(
+            run_id=active.run_id,
+            attempt_tag=active.attempt_tag,
+            job_name=active.job_name,
+            secret_name=active.job_name,
+            docker_secret_name=self._docker_secret_name(
+                active.run_id, active.attempt_tag
+            ),
+            reason=reason,
+            task_id=active.task_id,
+            parent_id=active.parent_id,
+            logs_delivered=reason != CLEANUP_REASON_KILLED,
+        )
+
+    @staticmethod
+    def _docker_secret_name(run_id: int, attempt_tag: str | None) -> str:
+        suffix = f"-{attempt_tag}" if attempt_tag else ""
+        return f"docker-login-secret-run-id-{run_id}{suffix}"
+
+    def _delete_generation(self, record: CleanupRecord) -> ResourceDeletionResult:
+        """Delete the exact resources pinned by a cleanup tombstone."""
+        result = delete_run_generation_resources(
+            job_name=record.job_name,
             namespace=self.task_namespace,
             core_api=self.core_api,
             batch_api=self.batch_api,
+            secret_name=record.secret_name,
+            docker_secret_name=record.docker_secret_name,
         )
-        annotations = job_to_kill.metadata.annotations
-        parent_id = annotations["task_parent_id"]
-        return KilledRun(
-            run_id=int(annotations["run_id"]),
-            task_id=int(annotations["task_id"]),
-            parent_id=int(parent_id) if parent_id else None,
-            logs=logs,
+        if not result.all_succeeded:
+            failed = [name for name, ok in result._asdict().items() if not ok]
+            self.registry.record_retry(
+                record.job_name, f"Failed to delete resources: {', '.join(failed)}"
+            )
+        return result
+
+    def _decrement_active_tasks(self) -> None:
+        self.num_active_tasks = max(0, self.num_active_tasks - 1)
+
+    def _list_our_jobs(self) -> list[k8s_client.V1Job]:
+        try:
+            return self.batch_api.list_namespaced_job(
+                self.task_namespace, label_selector=self.task_job_label_selector
+            ).items
+        except ApiException:
+            self.log.exception("Failed to list task jobs in the cluster")
+            return []
+
+    def _read_job(self, job_name: str) -> k8s_client.V1Job | None:
+        try:
+            return self.batch_api.read_namespaced_job(
+                name=job_name, namespace=self.task_namespace
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                self.log.exception("Failed to read job %s", job_name)
+            return None
+
+    # ------------------------------------------------------------------
+    # background reconciliation
+    # ------------------------------------------------------------------
+    def _start_cleanup_reconciler(self) -> None:
+        thread = threading.Thread(
+            target=self._cleanup_reconciler_worker,
+            daemon=True,
+            name="k8s-cleanup-reconciler",
         )
+        thread.start()
+
+    def _cleanup_reconciler_worker(self) -> None:
+        """Rebuild state from the cluster, then keep retrying pending deletions."""
+        try:
+            self._reconcile_with_cluster()
+        except Exception:
+            self.log.exception("Initial cluster reconciliation failed")
+
+        while True:
+            time.sleep(CLEANUP_RETRY_INTERVAL_SECONDS)
+            try:
+                self._process_cleanups()
+            except Exception:
+                self.log.exception("Cleanup reconciler iteration failed")
+
+    def _reconcile_with_cluster(self) -> None:
+        """
+        Align the registry with the actual cluster state after a node restart.
+
+        Unknown jobs rebuild active state; generations that conflict with a newer
+        registered generation are reclaimed; observed attempt tags advance the
+        counter so tags are never reused.
+        """
+        jobs = self._list_our_jobs()
+        for job in jobs:
+            annotations = job.metadata.annotations or {}
+            job_name = job.metadata.name
+            if self.registry.get_cleanup(job_name) is not None:
+                continue
+            tag = annotations.get(ANN_ATTEMPT_TAG) or None
+            try:
+                run_id = int(annotations["run_id"])
+            except (KeyError, TypeError, ValueError):
+                self.log.warning(
+                    "Job %s has no valid run_id annotation, cannot reconcile it",
+                    job_name,
+                )
+                continue
+
+            if tag:
+                try:
+                    self.registry.ensure_counter_at_least(int(tag[1:], 36))
+                except ValueError:
+                    pass
+
+            active = self.registry.get_active(run_id)
+            if active is not None and active.job_name == job_name:
+                continue
+            if active is None:
+                parent_id = annotations.get("task_parent_id")
+                self.registry.activate(
+                    ActiveRun(
+                        run_id=run_id,
+                        attempt_tag=tag or "legacy",
+                        job_name=job_name,
+                        task_id=int(annotations.get("task_id", 0)),
+                        parent_id=int(parent_id) if parent_id else None,
+                        init_org_id=int(annotations.get("init_org_id", 0)),
+                    )
+                )
+            else:
+                # a newer generation is registered: this job is stale leftovers
+                self.log.warning(
+                    "Reclaiming stale job %s while newer generation %s is registered "
+                    "for run_id=%s",
+                    job_name,
+                    active.job_name,
+                    run_id,
+                )
+                run_io = RunIO.from_dict(
+                    annotations,
+                    self.client,
+                    task_dir_extension=self._task_dir_extension,
+                )
+                self._reclaim_job(run_io, annotations)
+
+    def _process_cleanups(self) -> None:
+        """Retry deletion for every pending cleanup tombstone."""
+        for record in self.registry.list_cleanups():
+            result = self._delete_generation(record)
+            if not result.all_succeeded:
+                continue
+
+            if not record.logs_delivered and not self._deliver_kill_logs(record):
+                # keep the tombstone: the logs still need to reach HQ after
+                # reconnecting
+                continue
+
+            active = self.registry.get_active(record.run_id)
+            if active is not None and active.job_name == record.job_name:
+                self.registry.deactivate(record.run_id)
+            self.registry.remove_cleanup(record.job_name)
+
+    def _deliver_kill_logs(self, record: CleanupRecord) -> bool:
+        """
+        Send the kill logs to HQ as a log-only run update.
+
+        Returns False when HQ could not be reached (delivery is retried later); a
+        rejection by HQ is terminal and not retried.
+        """
+        if not self.share_algorithm_logs or not record.logs:
+            self.registry.mark_logs_delivered(record.job_name)
+            return True
+        try:
+            response = self.client.run.patch(record.run_id, data={"log": record.logs})
+        except Exception:
+            self.log.exception(
+                "Failed to deliver kill logs for run_id=%s; will retry",
+                record.run_id,
+            )
+            return False
+        if isinstance(response, dict) and "msg" not in response:
+            self.registry.mark_logs_delivered(record.job_name)
+            return True
+        self.log.warning(
+            "HQ rejected the kill log update for run_id=%s: %s; not retrying",
+            record.run_id,
+            response,
+        )
+        self.registry.mark_logs_delivered(record.job_name)
+        return True
+
+    def reconcile_with_hq(self, open_run_ids: set[int]) -> list[KilledRun]:
+        """
+        Reconcile local resources against the runs HQ still considers open.
+
+        Called after the open-run sync on every (re)connect. Resources whose run
+        is no longer open at HQ (including runs killed while this node was
+        offline) are reclaimed. Pending user-kill terminal feedback is flushed.
+
+        Parameters
+        ----------
+        open_run_ids: set[int]
+            Run ids that HQ reports as open
+
+        Returns
+        -------
+        list[KilledRun]
+            Killed generations whose terminal feedback still needs to be sent
+        """
+        for job in self._list_our_jobs():
+            annotations = job.metadata.annotations or {}
+            job_name = job.metadata.name
+            if self.registry.get_cleanup(job_name) is not None:
+                continue
+            try:
+                run_id = int(annotations["run_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if run_id in open_run_ids:
+                continue
+            run_io = RunIO.from_dict(
+                annotations, self.client, task_dir_extension=self._task_dir_extension
+            )
+            self.log.info(
+                "Run %s is no longer open at HQ but job %s still exists locally; "
+                "reclaiming its resources",
+                run_id,
+                job_name,
+            )
+            self._reclaim_job(run_io, annotations)
+
+        pending_reports = []
+        for record in self.registry.due_kill_reports():
+            pending_reports.append(
+                KilledRun(
+                    run_id=record.run_id,
+                    task_id=record.task_id,
+                    parent_id=record.parent_id,
+                    logs=record.logs,
+                    attempt_tag=record.attempt_tag,
+                )
+            )
+            self.registry.mark_killed_reported(record.job_name)
+        return pending_reports
+
+    def _reclaim_job(self, run_io: RunIO, annotations: dict) -> None:
+        """Delete resources of a generation that HQ no longer considers active."""
+        record = self._record_from_run_io(
+            run_io=run_io,
+            annotations=annotations,
+            reason=CLEANUP_REASON_RECONCILE,
+            logs="",
+            deliver_logs=False,
+        )
+        self.registry.add_cleanup(record)
+        self.registry.deactivate(run_io.run_id)
+        self._delete_generation(record)
 
 
 # TODO we need this code when we move to k8s clusters

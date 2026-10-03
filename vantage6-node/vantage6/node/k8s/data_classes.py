@@ -24,6 +24,8 @@ class Result(NamedTuple):
     init_org_id: int
         ID of the organization that initiated the task. Required to encrypt the
         result for them.
+    attempt_tag: str | None
+        Generation tag of the run attempt that produced this result
     """
 
     run_id: int
@@ -33,6 +35,7 @@ class Result(NamedTuple):
     status: RunStatus
     parent_id: int | None
     init_org_id: int
+    attempt_tag: str | None = None
 
 
 # Taken from docker_manager.py
@@ -52,3 +55,4 @@ class KilledRun(NamedTuple):
     task_id: int
     parent_id: int | None
     logs: str
+    attempt_tag: str | None = None

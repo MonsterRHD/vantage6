@@ -298,6 +298,31 @@ class DefaultSocketNamespace(Namespace):
         parent_id = data.get("parent_id")
 
         run: db.Run = db.Run.get(run_id)
+        if run is None:
+            # A callback for a run HQ no longer knows (or a stale callback after
+            # data cleanup) must not crash the handler.
+            self.log.warning(
+                "Received algorithm status '%s' for unknown run_id=%s; ignoring",
+                status,
+                run_id,
+            )
+            return
+
+        # Runs have a single terminal state. Once the run is finished (e.g. killed
+        # by the user, or already completed), any late or duplicated callback from
+        # a node - including a COMPLETED event emitted just before the kill reached
+        # the node - is ignored: it must not be re-broadcast and must not release
+        # dependent tasks.
+        if run.finished_at is not None:
+            self.log.info(
+                "Ignoring late status '%s' for run_id=%s which is already terminal "
+                "('%s')",
+                status,
+                run_id,
+                run.status,
+            )
+            return
+
         job_id = run.task.job_id
 
         # log event in HQ logs

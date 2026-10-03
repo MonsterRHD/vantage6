@@ -1,0 +1,37 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": false,
+    "reason": "节点在把 KilledRun 返回给发送方前就持久标记 killed_reported"
+  },
+  {
+    "id": 3,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 4,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 5,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 6,
+    "passed": false,
+    "reason": "重连收集 pending KilledRun 时在实际发送前再次标记 killed_reported"
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  }
+]

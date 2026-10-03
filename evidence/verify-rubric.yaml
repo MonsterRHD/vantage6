@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 清理只匹配同一 run 代次
+  - id: 2
+    type: f2p
+    text: 取消只产生一个终态结果可观察
+  - id: 3
+    type: f2p
+    text: 迟到完成不能复活结果可观察
+  - id: 4
+    type: f2p
+    text: Job Pod Secret 最终清理
+  - id: 5
+    type: f2p
+    text: 删除失败保留重试结果可观察
+  - id: 6
+    type: p2p
+    text: 断网重连继续清理结果可观察
+  - id: 7
+    type: p2p
+    text: 重启及旧单节点消息兼容结果可观察

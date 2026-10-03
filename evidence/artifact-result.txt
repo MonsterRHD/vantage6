@@ -1,0 +1,7 @@
+1 通过
+2 未通过 节点在把 KilledRun 返回给发送方前就持久标记 killed_reported
+3 通过
+4 通过
+5 通过
+6 未通过 重连收集 pending KilledRun 时在实际发送前再次标记 killed_reported
+7 通过

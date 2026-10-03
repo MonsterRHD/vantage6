@@ -777,6 +777,19 @@ class Run(SingleRunBase):
             room=f"collaboration_{run.task.collaboration.id}",
         )
 
+        # Release dependent tasks on completion from the authoritative REST update.
+        # This used to happen only on the node's socket callback, which can arrive
+        # late (or be dropped once the run is terminal); doing it here guarantees
+        # dependents are scheduled exactly when the COMPLETED state is persisted.
+        if run.status == RunStatus.COMPLETED.value:
+            for dependent_task in run.task.required_by:
+                self.socketio.emit(
+                    "new_task_update",
+                    {"id": dependent_task.id, "parent_id": dependent_task.parent_id},
+                    namespace="/tasks",
+                    room=f"collaboration_{dependent_task.collaboration_id}",
+                )
+
         return run_schema.dump(run, many=False), HTTPStatus.OK
 
     def _add_dependent_tasks(self, dependent_tasks: list[db.Task]) -> list[db.Task]:

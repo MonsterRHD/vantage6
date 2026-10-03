@@ -115,26 +115,37 @@ class TestKillContainersLogSharing(unittest.TestCase):
         node.config = {"share_algorithm_logs": share_algorithm_logs}
         node.client = Mock()
         node.client.collaboration_id = 7
-        node.client.whoami = Mock(id_=1)
+        node.client.whoami = Mock(id_=1, organization_id=3)
         node.k8s_container_manager = Mock()
         node.k8s_container_manager.kill_algorithm_runs.return_value = [
             KilledRun(run_id=1, task_id=2, parent_id=None, logs="sensitive kill logs")
         ]
         return node
 
-    def test_kill_logs_not_sent_when_sharing_disabled(self):
-        node = self._make_node(share_algorithm_logs=False)
-        node.kill_containers({"collaboration_id": 7})
+    def test_node_does_not_patch_kill_logs_itself(self):
+        # Kill log delivery (with retries) is owned by the container manager's
+        # cleanup reconciler; Node.kill_containers must no longer PATCH logs.
+        node = self._make_node(share_algorithm_logs=True)
+        killed = node.kill_containers(
+            {
+                "collaboration_id": 7,
+                "event_id": "evt-1",
+                "issued_at": "2026-10-03T10:00:00+00:00",
+            }
+        )
 
         node.client.run.patch.assert_not_called()
+        self.assertEqual(len(killed), 1)
+        node.k8s_container_manager.kill_algorithm_runs.assert_called_once()
+        kwargs = node.k8s_container_manager.kill_algorithm_runs.call_args.kwargs
+        self.assertEqual(kwargs["event_id"], "evt-1")
+        self.assertIsNotNone(kwargs["issued_at"])
 
-    def test_kill_logs_sent_when_sharing_enabled(self):
+    def test_no_logs_sent_when_event_targets_other_collaboration(self):
         node = self._make_node(share_algorithm_logs=True)
-        node.kill_containers({"collaboration_id": 7})
-
-        node.client.run.patch.assert_called_once_with(
-            id_=1, data={"log": "sensitive kill logs"}
-        )
+        killed = node.kill_containers({"collaboration_id": 999})
+        self.assertEqual(killed, [])
+        node.k8s_container_manager.kill_algorithm_runs.assert_not_called()
 
 
 if __name__ == "__main__":

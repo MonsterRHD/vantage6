@@ -17,7 +17,7 @@ from vantage6.cli.globals import (
     InfraComponentName,
 )
 from vantage6.cli.k8s_config import KubernetesConfig
-from vantage6.cli.node.common.task_cleanup import delete_run_related_pods
+from vantage6.cli.node.common.task_cleanup import delete_run_generation_resources
 from vantage6.cli.utils_kubernetes import create_kubernetes_apis_with_ssl_handling
 
 
@@ -169,15 +169,23 @@ def cleanup_task_jobs(
             error(f"Job '{job.metadata.name}' has no run_id annotation, skipping...")
             continue
 
-        # Use shared cleanup to delete job, pods and related secret
+        # Delete the exact resources of this run generation: the Job name is read
+        # from the cluster and the (generation-specific) Docker secret name from
+        # the Job annotations. Fall back to legacy naming for jobs created before
+        # generations existed.
         job_name = job.metadata.name
+        annotations = job.metadata.annotations or {}
+        docker_secret_name = annotations.get("docker_login_secret_name") or (
+            f"docker-login-secret-run-id-{run_id}"
+        )
         info(f"Deleting job '{job_name}' (run_id={run_id})")
-        delete_run_related_pods(
-            run_id=run_id,
-            container_name=f"{APPNAME}-run-{run_id}",
+        delete_run_generation_resources(
+            job_name=job_name,
             namespace=namespace,
             core_api=core_api,
             batch_api=batch_api,
+            secret_name=job_name,
+            docker_secret_name=docker_secret_name,
         )
         deletions += 1
 

@@ -1,0 +1,13 @@
+project-12｜vantage6 协作任务清理的代次隔离
+题目 ID：vantage6-vantage6-67c258e8-abf2-4093-a600-44c337676b23｜Harness：Trae｜有效轮数：120｜完成度：部分完成｜收录：长程题
+关键验证：终态守卫、代次清理、持久注册表和 CLI 清理共 41 项专项用例连续 10/10 通过；ruff 检查通过
+
+Rubric ID：1｜状态：通过｜期望行为：清理只匹配同一 run 代次｜实际观察：资源代次、迟到状态守卫、删除 tombstone 和旧消息路径由 41 项专项测试验证｜直接证据：终态守卫、代次清理、持久注册表和 CLI 清理共 41 项专项用例连续 10/10 通过；ruff 检查通过
+Rubric ID：2｜状态：未通过｜期望行为：取消只产生一个终态结果可观察｜实际观察：节点在把 KilledRun 返回给发送方前就持久标记 killed_reported｜直接证据：vantage6-node/vantage6/node/k8s/container_manager.py _finalize_cleanup_record 2022-2030｜原因：节点在把 KilledRun 返回给发送方前就持久标记 killed_reported｜影响：终态反馈发送失败后重连不会再次取得该取消结果｜证据位置：vantage6-node/vantage6/node/k8s/container_manager.py _finalize_cleanup_record 2022-2030
+Rubric ID：3｜状态：通过｜期望行为：迟到完成不能复活结果可观察｜实际观察：资源代次、迟到状态守卫、删除 tombstone 和旧消息路径由 41 项专项测试验证｜直接证据：终态守卫、代次清理、持久注册表和 CLI 清理共 41 项专项用例连续 10/10 通过；ruff 检查通过
+Rubric ID：4｜状态：通过｜期望行为：Job Pod Secret 最终清理｜实际观察：资源代次、迟到状态守卫、删除 tombstone 和旧消息路径由 41 项专项测试验证｜直接证据：终态守卫、代次清理、持久注册表和 CLI 清理共 41 项专项用例连续 10/10 通过；ruff 检查通过
+Rubric ID：5｜状态：通过｜期望行为：删除失败保留重试结果可观察｜实际观察：资源代次、迟到状态守卫、删除 tombstone 和旧消息路径由 41 项专项测试验证｜直接证据：终态守卫、代次清理、持久注册表和 CLI 清理共 41 项专项用例连续 10/10 通过；ruff 检查通过
+Rubric ID：6｜状态：未通过｜期望行为：断网重连继续清理结果可观察｜实际观察：重连收集 pending KilledRun 时在实际发送前再次标记 killed_reported｜直接证据：vantage6-node/vantage6/node/k8s/container_manager.py reconcile_with_hq 2332-2344｜原因：重连收集 pending KilledRun 时在实际发送前再次标记 killed_reported｜影响：重连期间发送失败会永久清除后续重试资格｜证据位置：vantage6-node/vantage6/node/k8s/container_manager.py reconcile_with_hq 2332-2344
+Rubric ID：7｜状态：通过｜期望行为：重启及旧单节点消息兼容结果可观察｜实际观察：资源代次、迟到状态守卫、删除 tombstone 和旧消息路径由 41 项专项测试验证｜直接证据：终态守卫、代次清理、持久注册表和 CLI 清理共 41 项专项用例连续 10/10 通过；ruff 检查通过
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。

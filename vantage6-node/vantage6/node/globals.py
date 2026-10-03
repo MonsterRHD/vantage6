@@ -37,6 +37,10 @@ TIME_LIMIT_INITIAL_CONNECTION_WEBSOCKET = 60
 # constants for retrying task start due to a temporary error
 TASK_START_RETRIES = 3
 
+# Interval between attempts to delete Kubernetes resources that have a pending
+# cleanup record (e.g. because a previous deletion failed or was interrupted).
+CLEANUP_RETRY_INTERVAL_SECONDS = 10
+
 # Environment variables that should be set in the Dockerfile and that may not
 # be overwritten by the user.
 ENV_VARS_NOT_SETTABLE_BY_NODE = ["PKG_NAME"]

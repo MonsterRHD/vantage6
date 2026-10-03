@@ -30,6 +30,7 @@ class RunIO:
         client: NodeClient,
         dataframe_details: dict | None = None,
         task_dir_extension: str | None = None,
+        attempt_tag: str | None = None,
     ):
         """
         Responsible for the IO files between the node and the algorithm.
@@ -51,6 +52,10 @@ class RunIO:
             Extension to the directory to put the run files in. This is used to prevent
             that nodes use the same task directory in a development environment.
             Defaults to None.
+        attempt_tag: str, optional
+            Generation tag of this run attempt. Resources and IO files of different
+            attempts of the same run are kept separate. None denotes a legacy attempt
+            without generation tags.
         """
 
         self.log = logging.getLogger(logger_name(__name__))
@@ -63,14 +68,18 @@ class RunIO:
         self.df_id = dataframe_details.get("id") if dataframe_details else None
         self.db_label = dataframe_details.get("db_label") if dataframe_details else None
         self.client = client
+        self.attempt_tag = attempt_tag
 
-        # This run needs its own directory to store the IO files
+        # This run needs its own directory to store the IO files. IO files are
+        # separated per attempt so that cleanup of an old generation never touches
+        # files of a newer one.
+        run_path_parts = [TASK_FILES_ROOT]
         if task_dir_extension:
-            self.run_folder = os.path.join(
-                TASK_FILES_ROOT, task_dir_extension, str(self.run_id)
-            )
-        else:
-            self.run_folder = os.path.join(TASK_FILES_ROOT, str(self.run_id))
+            run_path_parts.append(task_dir_extension)
+        run_path_parts.append(str(self.run_id))
+        if attempt_tag:
+            run_path_parts.append(attempt_tag)
+        self.run_folder = os.path.join(*run_path_parts)
 
     @classmethod
     def from_dict(
@@ -88,6 +97,7 @@ class RunIO:
             },
             client=client,
             task_dir_extension=task_dir_extension,
+            attempt_tag=data.get("attempt_tag") or None,
         )
 
     @property
@@ -104,7 +114,15 @@ class RunIO:
 
     @property
     def container_name(self) -> str:
+        if self.attempt_tag:
+            return f"{APPNAME}-run-{self.run_id}-{self.attempt_tag}"
         return f"{APPNAME}-run-{self.run_id}"
+
+    @property
+    def docker_login_secret_name(self) -> str:
+        if self.attempt_tag:
+            return f"docker-login-secret-run-id-{self.run_id}-{self.attempt_tag}"
+        return f"docker-login-secret-run-id-{self.run_id}"
 
     @property
     def output_file(self) -> str:
@@ -149,7 +167,10 @@ class RunIO:
         """
         self.log.debug("Creating file %s for run %s", filename, self.run_id)
 
-        relative_path = Path(str(self.run_id)) / filename
+        relative_path = Path(str(self.run_id))
+        if self.attempt_tag:
+            relative_path = relative_path / self.attempt_tag
+        relative_path = relative_path / filename
         file_path = Path(self.run_folder) / filename
 
         file_dir = Path(file_path).parent

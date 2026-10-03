@@ -370,6 +370,52 @@ class Node:
         self.__add_task_runs_to_queue(runs_to_execute)
         self.log.info("Received %s tasks", self.runs_queue._qsize())
 
+        # Reconcile local Kubernetes resources with what HQ reports as open: this
+        # reclaims runs that were killed while this node was offline and flushes
+        # any pending kill feedback after a reconnect or restart.
+        open_run_ids = {run["id"] for run in runs_to_execute}
+        killed_runs = self.k8s_container_manager.reconcile_with_hq(open_run_ids)
+        if killed_runs:
+            self.__emit_killed_runs(killed_runs)
+
+    def __emit_killed_runs(self, killed_runs: list) -> None:
+        """Notify HQ of run generations killed locally but not yet acknowledged."""
+        for killed in killed_runs:
+            self.socketIO.emit(
+                "algorithm_status_change",
+                {
+                    "run_id": killed.run_id,
+                    "task_id": killed.task_id,
+                    "collaboration_id": self.client.collaboration_id,
+                    "node_id": self.client.whoami.id_,
+                    "status": RunStatus.KILLED.value,
+                    "organization_id": self.client.whoami.organization_id,
+                    "parent_id": killed.parent_id,
+                },
+                namespace="/tasks",
+            )
+
+    def __run_is_open(self, run_id: int, task_id: int) -> bool:
+        """
+        Verify with HQ that a run is still open right before starting it.
+
+        This prevents a new generation from being created for a run that was
+        cancelled while a stale copy of it was still sitting in the local queue.
+        Transient HQ communication errors do not block the run.
+        """
+        try:
+            open_runs = self.client.run.list(
+                state=TaskStatusQueryOptions.OPEN.value,
+                include_task=False,
+                task_id=task_id,
+            )
+        except Exception:
+            self.log.exception(
+                "Could not verify open status of run %s with HQ; continuing", run_id
+            )
+            return True
+        return any(run.get("id") == run_id for run in open_runs)
+
     def get_task_and_add_to_queue(self, task_id: int) -> None:
         """
         Fetches (open) task with task_id from HQ. The task ID is delivered by the
@@ -400,7 +446,7 @@ class Node:
         """
         for run_to_execute in runs_to_execute:
             try:
-                if not self.k8s_container_manager.is_running(run_to_execute["id"]):
+                if not self.k8s_container_manager.is_run_active(run_to_execute["id"]):
                     self.runs_queue.put(run_to_execute)
                 else:
                     self.log.info(
@@ -426,6 +472,16 @@ class Node:
 
         # notify that we are processing this task
         run_id = run_to_execute["id"]
+
+        # Do not create a new generation if HQ has already moved this run to a
+        # terminal state (e.g. it was cancelled while the run was in the queue).
+        if not self.__run_is_open(run_id, task["id"]):
+            self.log.warning(
+                "Not starting run %s of task %s: it is no longer open at HQ.",
+                run_id,
+                task["id"],
+            )
+            return
 
         self.client.set_run_start_time(run_id)
 
@@ -579,9 +635,29 @@ class Node:
             "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "result": results.data,
         }
-        self.client.run.patch(
+        response = self.client.run.patch(
             id_=results.run_id, data=data, init_org_id=results.init_org_id
         )
+
+        # HQ rejects updates of already terminal runs (a kill can win the race) and
+        # unreachable HQ returns an error string. In both cases the run must not
+        # receive a second terminal status via socket, which could resurrect a
+        # killed task or release dependent tasks prematurely.
+        if isinstance(response, dict) and "msg" in response:
+            self.log.warning(
+                "HQ rejected the result of run %s: %s. No status event is sent.",
+                results.run_id,
+                response.get("msg"),
+            )
+            return
+        if not isinstance(response, dict):
+            self.log.warning(
+                "Could not deliver the result of run %s to HQ (%s). No status "
+                "event is sent to avoid broadcasting a state HQ has no record of.",
+                results.run_id,
+                response,
+            )
+            return
 
         # notify HQ, other nodes, and clients about algorithm status change
         self.__emit_algorithm_status_change(
@@ -782,7 +858,8 @@ class Node:
         ----------
         kill_info: dict
             Dictionary received over websocket with instructions for which
-            tasks to kill
+            tasks to kill. May include an event_id and issued_at timestamp used
+            to drop duplicate or out-of-order instructions.
 
         Returns
         -------
@@ -805,21 +882,25 @@ class Node:
         # kill specific task if specified, else kill all algorithms
         kill_list = kill_info.get("kill_list")
         if kill_list:
-            kill_list = [ToBeKilled(**kill_info) for kill_info in kill_list]
-        killed_algos = self.k8s_container_manager.kill_algorithm_runs(
-            kill_list=kill_list
+            kill_list = [ToBeKilled(**entry) for entry in kill_list]
+
+        # Kill logs are delivered (and retried) by the container manager's
+        # cleanup reconciler, so only the killed generations are returned here.
+        return self.k8s_container_manager.kill_algorithm_runs(
+            kill_list=kill_list,
+            event_id=kill_info.get("event_id"),
+            issued_at=self._parse_kill_timestamp(kill_info.get("issued_at")),
         )
-        # update logs of killed tasks. Note that the status is already set to KILLED
-        # by HQ.
-        if self.config.get("share_algorithm_logs", True):
-            for killed_algo in killed_algos:
-                self.client.run.patch(
-                    id_=killed_algo.run_id,
-                    data={
-                        "log": killed_algo.logs,
-                    },
-                )
-        return killed_algos
+
+    @staticmethod
+    def _parse_kill_timestamp(issued_at: str | None) -> float | None:
+        """Parse an ISO-8601 kill event timestamp to a unix timestamp."""
+        if not issued_at:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(issued_at).timestamp()
+        except ValueError:
+            return None
 
     def share_node_details(self) -> None:
         """
