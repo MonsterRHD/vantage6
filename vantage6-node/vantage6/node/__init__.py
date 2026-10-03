@@ -61,6 +61,7 @@ from vantage6.node.globals import (
 )
 from vantage6.node.k8s.container_manager import ContainerManager
 from vantage6.node.k8s.data_classes import Result, ToBeKilled
+from vantage6.node.k8s.session_manager import SessionFileManager
 from vantage6.node.socket import NodeTaskNamespace
 from vantage6.node.util import get_parent_id
 
@@ -123,6 +124,19 @@ class Node:
             sys.exit(1)
 
         self.check_algorithm_isolation()
+
+        # Remove parquet temp files left behind if the node died while writing
+        # session files. Done before any thread or socket connection can write
+        # session files; runs that were not reported yet are reprocessed from
+        # their retained k8s jobs and output files.
+        stale_temps = SessionFileManager.recover_temp_files(
+            task_dir_extension=self.config.get("dev", {}).get("task_dir_extension")
+        )
+        if stale_temps:
+            self.log.warning(
+                "Cleaned up %s incomplete session file(s) from an earlier run",
+                len(stale_temps),
+            )
 
         self.log.info("Connecting to HQ: %s", self.client.hq_url)
 
@@ -551,6 +565,10 @@ class Node:
                 results = self.k8s_container_manager.process_next_completed_run()
                 self.log.info(f"Sending result (run={results.run_id}) to HQ!")
                 self.__report_finished_run(results)
+                # Only delete the k8s job (and its output) after HQ accepted the
+                # result. If reporting failed, the job stays in place and the run
+                # is processed and reported again on the next iteration.
+                self.k8s_container_manager.acknowledge_finished_run(results.run_id)
             except Exception as e:
                 self.log.exception(
                     "poll_task_results (Speaking) thread had an exception: %s",

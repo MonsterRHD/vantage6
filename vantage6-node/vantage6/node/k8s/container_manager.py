@@ -22,6 +22,7 @@ from vantage6.common.docker.addons import (
 )
 from vantage6.common.enum import AlgorithmStepType, RunStatus, TaskDatabaseType
 from vantage6.common.globals import (
+    APPNAME,
     DATAFRAME_BETWEEN_GROUPS_SEPARATOR,
     DATAFRAME_WITHIN_GROUP_SEPARATOR,
     DEFAULT_ALPINE_IMAGE,
@@ -78,6 +79,10 @@ class ContainerManager:
         self.client = client
         self.socket_io = None
         self.num_active_tasks = 0
+        # runs that already reached a terminal state on the node (result
+        # acknowledged by HQ or killed); prevents double counting or deleting
+        # when reporting and a kill instruction race
+        self._finalized_runs: set[int] = set()
 
         # When a pod runs in Kubernetes with a ServiceAccount, Kubernetes automatically
         # mounts the service account credentials at
@@ -1472,6 +1477,11 @@ class ContainerManager:
         the Kubernetes jobs and returns the results of the first completed task run.
         The results are then sent back to HQ.
 
+        The k8s job is intentionally not deleted here. It is removed only after HQ has
+        acknowledged the result in :meth:`acknowledge_finished_run`, so that a failed
+        upload leaves the job and the local output file in place and the run can be
+        processed again instead of being lost.
+
         Returns
         -------
         Result
@@ -1502,6 +1512,12 @@ class ContainerManager:
             # Check if any of the jobs is completed
             for job in finished_jobs:
                 annotations = job.metadata.annotations
+                run_id = int(annotations["run_id"])
+                # a job may still be listed shortly after its resources were
+                # deleted following a successful report or a kill instruction
+                if run_id in self._finalized_runs:
+                    continue
+
                 # Create helper object to process the output of the job
                 run_io = RunIO.from_dict(
                     annotations,
@@ -1535,18 +1551,64 @@ class ContainerManager:
                     init_org_id=int(annotations["init_org_id"]),
                 )
 
-                self.num_active_tasks -= 1
-
-                delete_run_related_pods(
-                    run_id=run_io.run_id,
-                    container_name=run_io.container_name,
-                    namespace=self.task_namespace,
-                    core_api=self.core_api,
-                    batch_api=self.batch_api,
-                )
                 completed_job = True
 
+            if not completed_job:
+                # all finished jobs were already acknowledged but still show up
+                # in the listing; wait for the deletion to settle
+                time.sleep(1)
+
         return result
+
+    def _mark_run_inactive(self, run_id: int) -> bool:
+        """
+        Decrement the active-task counter once for a finalized run.
+
+        Parameters
+        ----------
+        run_id: int
+            ID of the run that completed or was killed
+
+        Returns
+        -------
+        bool
+            False if this run was already finalized (reported or killed)
+        """
+        if run_id in self._finalized_runs:
+            return False
+        self._finalized_runs.add(run_id)
+        self.num_active_tasks -= 1
+        return True
+
+    def acknowledge_finished_run(self, run_id: int) -> None:
+        """
+        Mark a run as fully delivered to HQ and clean up its k8s resources.
+
+        Must only be called after the result of the run has been successfully
+        reported to HQ. If reporting fails, this is not called and the finished
+        job (plus its local output file) remains available so that the speaking
+        thread can process the run again.
+
+        Parameters
+        ----------
+        run_id: int
+            ID of the run whose result was acknowledged by HQ
+        """
+        if not self._mark_run_inactive(run_id):
+            return
+
+        try:
+            delete_run_related_pods(
+                run_id=run_id,
+                container_name=f"{APPNAME}-run-{run_id}",
+                namespace=self.task_namespace,
+                core_api=self.core_api,
+                batch_api=self.batch_api,
+            )
+        except Exception:
+            self.log.exception(
+                "Error cleaning up kubernetes resources of run %s", run_id
+            )
 
     def _get_logs(self, run_io: RunIO) -> str:
         """
@@ -1735,9 +1797,14 @@ class ContainerManager:
         # kill the jobs that should be killed
         killed_list: list[KilledRun] = []
         for job in current_jobs.items:
+            if int(job.metadata.annotations["run_id"]) in self._finalized_runs:
+                # completed runs awaiting (or done with) result delivery are
+                # not killed: their result reporting must not be overridden
+                continue
             if self._task_job_should_be_killed(job, kill_list):
                 killed_run = self._kill_task_job(job, initiator)
-                killed_list.append(killed_run)
+                if killed_run is not None:
+                    killed_list.append(killed_run)
 
         # log warnings if jobs should be killed but are not found
         if kill_list:
@@ -1783,7 +1850,7 @@ class ContainerManager:
 
     def _kill_task_job(
         self, job_to_kill: k8s_client.V1Job, initiator: KillInitiator
-    ) -> KilledRun:
+    ) -> KilledRun | None:
         """
         Kill a job
 
@@ -1796,8 +1863,8 @@ class ContainerManager:
 
         Returns
         -------
-        KilledRun:
-            Information on the killed run
+        KilledRun | None:
+            Information on the killed run, or None if it was already finalized
         """
         self.log.info(
             "Killing for run_id=%s", job_to_kill.metadata.annotations["run_id"]
@@ -1807,12 +1874,14 @@ class ContainerManager:
             self.client,
             task_dir_extension=self.ctx.config.get("dev", {}).get("task_dir_extension"),
         )
+        if not self._mark_run_inactive(run_io.run_id):
+            self.log.info("Run %s was already finalized, not killing it", run_io.run_id)
+            return None
         logs = self._get_logs(run_io)
         if initiator == KillInitiator.USER:
             logs += "\n\nAlgorithm was killed by user request."
         elif initiator == KillInitiator.NODE_SHUTDOWN:
             logs += "\n\nAlgorithm was killed because the node was shut down."
-        self.num_active_tasks -= 1
         delete_run_related_pods(
             run_id=run_io.run_id,
             container_name=run_io.container_name,

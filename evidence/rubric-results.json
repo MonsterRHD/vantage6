@@ -1,0 +1,37 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 4,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 5,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 6,
+    "passed": false,
+    "reason": "HQ 接受结果后到 acknowledge_finished_run 前退出时，本地没有持久确认记录，重启会再次回报同一 run"
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  }
+]

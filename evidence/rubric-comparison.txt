@@ -1,0 +1,13 @@
+project-11｜vantage6 Parquet 结果文件的原子发布
+题目 ID：vantage6-vantage6-87c014a9-0a19-4516-9638-9f5654feb3b7｜Harness：Trae｜有效轮数：84｜完成度：部分完成｜收录：难题
+关键验证：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+
+Rubric ID：1｜状态：通过｜期望行为：写入未完成文件不可见结果可观察｜实际观察：临时文件关闭、原子替换、失败状态、重启清理和兼容路径由 28 项专项测试验证｜直接证据：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+Rubric ID：2｜状态：通过｜期望行为：完整关闭后才发布结果可观察｜实际观察：临时文件关闭、原子替换、失败状态、重启清理和兼容路径由 28 项专项测试验证｜直接证据：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+Rubric ID：3｜状态：通过｜期望行为：读失败不发送完成结果可观察｜实际观察：临时文件关闭、原子替换、失败状态、重启清理和兼容路径由 28 项专项测试验证｜直接证据：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+Rubric ID：4｜状态：通过｜期望行为：回传失败保留重试结果可观察｜实际观察：临时文件关闭、原子替换、失败状态、重启清理和兼容路径由 28 项专项测试验证｜直接证据：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+Rubric ID：5｜状态：通过｜期望行为：重启处理临时文件结果可观察｜实际观察：临时文件关闭、原子替换、失败状态、重启清理和兼容路径由 28 项专项测试验证｜直接证据：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+Rubric ID：6｜状态：未通过｜期望行为：同一 run 不重复结果｜实际观察：HQ 接受结果后到 acknowledge_finished_run 前退出时，本地没有持久确认记录，重启会再次回报同一 run｜直接证据：vantage6-node/vantage6/node/__init__.py 565-571；container_manager.py _finalized_runs｜原因：HQ 接受结果后到 acknowledge_finished_run 前退出时，本地没有持久确认记录，重启会再次回报同一 run｜影响：同一结果会再次触发 HQ PATCH 和完成状态事件｜证据位置：vantage6-node/vantage6/node/__init__.py 565-571；container_manager.py _finalized_runs
+Rubric ID：7｜状态：通过｜期望行为：纯文本与取消路径兼容结果可观察｜实际观察：临时文件关闭、原子替换、失败状态、重启清理和兼容路径由 28 项专项测试验证｜直接证据：结果发布、RunIO、SessionFileManager 共 28 项专项用例连续 10/10 通过；ruff check 与 format 检查通过
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。

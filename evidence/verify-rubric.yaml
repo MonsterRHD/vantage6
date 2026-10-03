@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 写入未完成文件不可见结果可观察
+  - id: 2
+    type: f2p
+    text: 完整关闭后才发布结果可观察
+  - id: 3
+    type: f2p
+    text: 读失败不发送完成结果可观察
+  - id: 4
+    type: f2p
+    text: 回传失败保留重试结果可观察
+  - id: 5
+    type: f2p
+    text: 重启处理临时文件结果可观察
+  - id: 6
+    type: p2p
+    text: 同一 run 不重复结果
+  - id: 7
+    type: p2p
+    text: 纯文本与取消路径兼容结果可观察

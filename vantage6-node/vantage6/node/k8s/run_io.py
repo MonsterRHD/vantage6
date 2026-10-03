@@ -191,11 +191,21 @@ class RunIO:
             with open(self.output_file, "rb") as fp:
                 result = fp.read()
 
-            # update the session state that compute run has been completed
-            self.session_file_manager.update_state_file(
-                action=self.action.value,
-                message="Algorithm completed successfully.",
-            )
+            # update the session state that compute run has been completed.
+            # This is bookkeeping only: it must not prevent delivery of the
+            # plain-text result, so a failure to record it is logged but does
+            # not change the run status. The entry is deduplicated by run id,
+            # so reprocessing this run cannot add duplicate state entries.
+            try:
+                self.session_file_manager.update_state_file(
+                    action=self.action.value,
+                    message="Algorithm completed successfully.",
+                    run_id=self.run_id,
+                )
+            except Exception:
+                self.log.exception(
+                    "Error updating session state for run %s", self.run_id
+                )
             return result, RunStatus.COMPLETED
         else:
             self.log.error("Unknown action: %s", self.action)
@@ -233,18 +243,35 @@ class RunIO:
         try:
             self.session_file_manager.write_dataframe_file(algo_result, self.df_name)
         except Exception:
+            # The dataframe file is published atomically, so on failure the
+            # previous valid dataframe file remains in place and no partial
+            # file is visible. This is a local failure that will not resolve
+            # by sending a completion status, so report the run as failed.
             self.log.exception("Error writing data frame to parquet file")
             return RunStatus.FAILED
 
-        self.session_file_manager.update_state_file(
-            action=self.action.value,
-            message="Session updated.",
-            filename=f"{self.df_name}.parquet",
-            df_name=self.df_name,
-        )
+        try:
+            self.session_file_manager.update_state_file(
+                action=self.action.value,
+                message="Session updated.",
+                filename=f"{self.df_name}.parquet",
+                df_name=self.df_name,
+                run_id=self.run_id,
+            )
+        except Exception:
+            # The dataframe itself is complete, but without the state entry
+            # subsequent runs would not have a consistent session view, so the
+            # run must not be reported as completed.
+            self.log.exception("Error updating session state file")
+            return RunStatus.FAILED
 
         # Each node reports the column names for this dataframe in the session. In the
-        # horizontal case all the nodes should report the same column names.
+        # horizontal case all the nodes should report the same column names. A failure
+        # here (e.g. HQ unreachable) must leave the run retryable, so the exception is
+        # deliberately not caught: the k8s job and output file are kept and this run is
+        # reprocessed. Reprocessing is idempotent: the dataframe is overwritten with the
+        # same output, the state entry is deduplicated by run id and HQ replaces (rather
+        # than appends) the columns for this node and dataframe.
         columns_info = [
             {"name": field.name, "dtype": str(field.type)}
             for field in algo_result.schema
