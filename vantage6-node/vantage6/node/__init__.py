@@ -44,6 +44,7 @@ from vantage6.common.client.node_client import NodeClient
 from vantage6.common.enum import AlgorithmStepType, RunStatus, TaskStatusQueryOptions
 from vantage6.common.exceptions import EncryptionMismatchError
 from vantage6.common.globals import (
+    APPNAME,
     PING_INTERVAL_SECONDS,
     NodeConfigKey,
     NodePolicy,
@@ -400,13 +401,23 @@ class Node:
         """
         for run_to_execute in runs_to_execute:
             try:
-                if not self.k8s_container_manager.is_running(run_to_execute["id"]):
+                run_id = run_to_execute["id"]
+                container_name = f"{APPNAME}-run-{run_id}"
+                if not self.k8s_container_manager.is_running(container_name):
                     self.runs_queue.put(run_to_execute)
                 else:
                     self.log.info(
                         "Not starting task %s - %s as it is already running",
                         run_to_execute["task"]["id"],
                         run_to_execute["task"]["name"],
+                    )
+                    # The pod survived a node restart: re-attach the log stream
+                    # at the cursor HQ persisted, so the unconfirmed tail is
+                    # re-sent and the rest is not duplicated.
+                    self.k8s_container_manager.reattach_log_stream(
+                        run_id=run_id,
+                        task_id=run_to_execute["task"]["id"],
+                        start_seq=run_to_execute.get("log_seq") or 0,
                     )
             except Exception:
                 self.log.exception("Error while syncing task queue")
@@ -570,7 +581,7 @@ class Node:
             Result of the completed run
         """
         if self.config.get("share_algorithm_logs", True):
-            logs = results.logs
+            logs = results.logs or ""
         else:
             logs = "Node does not allow sharing algorithm logs"
         data = {
@@ -696,6 +707,11 @@ class Node:
 
         self.socketIO.register_namespace(NodeTaskNamespace("/tasks"))
         NodeTaskNamespace.node_worker_ref = self
+
+        # Keep the container manager pointed at the current socket connection;
+        # connect_to_socket is also called after token refreshes, which create
+        # a brand new SocketIO client.
+        self.k8s_container_manager.set_socket(self.socketIO)
 
         self.socketIO.connect(
             url=self.client.hq_url,

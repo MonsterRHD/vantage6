@@ -138,3 +138,65 @@ class TestResources(TestResourceBase):
             col.delete()
             org1.delete()
             org2.delete()
+
+    def test_run_log_query_returns_empty_string_when_no_log(self):
+        org = Organization()
+        col = Collaboration(organizations=[org])
+        task = Task(collaboration=col, image="some-image", init_org=org)
+        task.save()
+        run = Run(
+            task=task,
+            organization=org,
+            status=RunStatus.PENDING.value,
+            action=AlgorithmStepType.CENTRAL_COMPUTE.value,
+        )
+        run.save()
+        try:
+            headers = self.login_as_root()
+            response = self.app.get(f"/api/run/{run.id}", headers=headers)
+            self.assertEqual(response.status_code, HTTPStatus.OK)
+            self.assertEqual(response.json["log"], "")
+            # the acknowledgement cursor is exposed so nodes can resume a log
+            # stream after a restart
+            self.assertEqual(response.json["log_seq"], 0)
+        finally:
+            run.delete()
+            task.delete()
+            col.delete()
+            org.delete()
+
+    def test_run_patch_empty_log_is_kept_and_status_patch_preserves_it(self):
+        org = Organization(name=str(uuid.uuid1()))
+        col = Collaboration(name=str(uuid.uuid1()), organizations=[org])
+        col.save()
+        node = self.create_node(organization=org, collaboration=col)
+        task = Task(
+            image="localhost/algorithms/test:local",
+            collaboration=col,
+            init_org=org,
+        )
+        task.save()
+        run = Run(task=task, organization=org, status=RunStatus.PENDING.value)
+        run.save()
+        try:
+            headers = self.login_node(node)
+            response = self.app.patch(
+                f"/api/run/{run.id}", headers=headers, json={"log": ""}
+            )
+            self.assertEqual(response.status_code, HTTPStatus.OK)
+            self.assertEqual(response.json["log"], "")
+
+            # a status-only PATCH must not erase the (empty) log
+            response = self.app.patch(
+                f"/api/run/{run.id}",
+                headers=headers,
+                json={"status": RunStatus.PENDING.value},
+            )
+            self.assertEqual(response.status_code, HTTPStatus.OK)
+            self.assertEqual(response.json["log"], "")
+        finally:
+            run.delete()
+            task.delete()
+            node.delete()
+            col.delete()
+            org.delete()

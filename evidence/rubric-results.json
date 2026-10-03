@@ -1,0 +1,37 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": false,
+    "reason": "连续两次确认超时后节点进入无确认模式并把发送行直接计为已确认"
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "HQ 模型新增 log_seq 列但仓库没有现有数据库的升级脚本或迁移入口"
+  },
+  {
+    "id": 5,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 6,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  }
+]

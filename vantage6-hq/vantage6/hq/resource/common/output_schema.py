@@ -165,6 +165,10 @@ class RunSchema(HATEOASModelSchema):
         model = db.Run
         exclude = ("result",)
 
+    # A run without any log lines must be reported with an empty string rather
+    # than null, so that log queries always return a deterministic value.
+    log = fields.Function(lambda obj: obj.log if obj.log is not None else "")
+
     organization = fields.Method("organization")
     task = fields.Method("task")
     results = fields.Method("result_link")

@@ -37,6 +37,23 @@ TIME_LIMIT_INITIAL_CONNECTION_WEBSOCKET = 60
 # constants for retrying task start due to a temporary error
 TASK_START_RETRIES = 3
 
+# Algorithm log streaming over the websocket connection. The node streams pod
+# log lines with a per-run sequence number and only advances when HQ
+# acknowledges the cursor.
+# Seconds to wait for an HQ acknowledgement before resending the line.
+LOG_STREAM_ACK_TIMEOUT_SECONDS = 5
+# Backoff between attempts to resend a line that HQ did not acknowledge.
+LOG_STREAM_SEND_RETRY_SECONDS = 2
+# Backoff between attempts to re-establish an interrupted Kubernetes log watch.
+LOG_STREAM_WATCH_RETRY_SECONDS = 2
+# Interval at which a paused stream checks whether the socket reconnected.
+LOG_STREAM_DISCONNECT_POLL_SECONDS = 1
+# Consecutive acknowledgement timeouts after which the node assumes that HQ
+# does not support cursors and falls back to unacknowledged streaming.
+LOG_STREAM_LEGACY_ACK_TIMEOUTS = 2
+# Number of attempts to find the task pod on (re)attach before giving up.
+LOG_STREAM_NO_POD_RETRIES = 30
+
 # Environment variables that should be set in the Dockerfile and that may not
 # be overwritten by the user.
 ENV_VARS_NOT_SETTABLE_BY_NODE = ["PKG_NAME"]

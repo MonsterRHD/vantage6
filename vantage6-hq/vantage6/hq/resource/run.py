@@ -698,7 +698,7 @@ class Run(SingleRunBase):
                         "msg": "Only the log can be updated for a killed run!"
                     }, HTTPStatus.BAD_REQUEST
                 # update the log
-                run.log = data.get("log")
+                run.log = data.get("log") or ""
                 run.save()
                 return run_schema.dump(run, many=False), HTTPStatus.OK
             else:
@@ -709,7 +709,11 @@ class Run(SingleRunBase):
         run.started_at = parse_datetime(data.get("started_at"), run.started_at)
         run.finished_at = parse_datetime(data.get("finished_at"))
         run.result = data.get("result")
-        run.log = data.get("log")
+        # Only overwrite the log when the node actually sends one; status-only
+        # PATCHes (e.g. setting the start time) must not erase live-streamed
+        # logs. An explicit empty string marks "no log output" and is kept.
+        if "log" in data:
+            run.log = data.get("log") or ""
         run.status = data.get("status", run.status)
         run.save()
 

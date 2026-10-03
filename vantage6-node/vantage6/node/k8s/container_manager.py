@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from enum import Enum
 from itertools import groupby
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from vantage6.common.docker.addons import (
 )
 from vantage6.common.enum import AlgorithmStepType, RunStatus, TaskDatabaseType
 from vantage6.common.globals import (
+    APPNAME,
     DATAFRAME_BETWEEN_GROUPS_SEPARATOR,
     DATAFRAME_WITHIN_GROUP_SEPARATOR,
     DEFAULT_ALPINE_IMAGE,
@@ -43,6 +45,12 @@ from vantage6.node.globals import (
     DEFAULT_PROXY_PORT,
     ENV_VARS_NOT_SETTABLE_BY_NODE,
     K8S_EVENT_STREAM_LOOP_TIMEOUT,
+    LOG_STREAM_ACK_TIMEOUT_SECONDS,
+    LOG_STREAM_DISCONNECT_POLL_SECONDS,
+    LOG_STREAM_LEGACY_ACK_TIMEOUTS,
+    LOG_STREAM_NO_POD_RETRIES,
+    LOG_STREAM_SEND_RETRY_SECONDS,
+    LOG_STREAM_WATCH_RETRY_SECONDS,
     TASK_JOB_INPUT_PATH,
     TASK_JOB_OUTPUT_PATH,
     TASK_JOB_SESSION_FOLDER_PATH,
@@ -59,6 +67,418 @@ from vantage6.node.k8s.jobpod_state_to_run_status_mapper import (
 from vantage6.node.k8s.network_isolation import validate_algorithm_isolation
 from vantage6.node.k8s.run_io import RunIO
 from vantage6.node.util import get_parent_id
+
+
+class LogStreamState(Enum):
+    """Observable states of an algorithm log stream."""
+
+    STARTING = "starting"
+    ACTIVE = "active"
+    # socket to HQ is down; the stream parks and keeps the unconfirmed tail
+    DISCONNECTED_RETRY = "disconnected_retry"
+    # socket is up but HQ did not accept/acknowledge a line
+    SEND_FAILED_RETRY = "send_failed_retry"
+    # the Kubernetes log watch was interrupted and is being re-established
+    K8S_WATCH_RETRY = "k8s_watch_retry"
+    # task pod temporarily not found
+    NO_POD_RETRY = "no_pod_retry"
+    # HQ does not support cursors; stream without acknowledgements
+    LEGACY = "legacy"
+    # HQ reports the run finished; its complete log is delivered via REST
+    FINALIZED = "finalized"
+    STOPPED = "stopped"
+
+
+class _LogResendRequested(Exception):
+    """Internal signal: HQ asked to resend the unconfirmed tail."""
+
+    def __init__(self, ack_seq: int) -> None:
+        super().__init__(f"HQ requests resend from seq {ack_seq}")
+        self.ack_seq = ack_seq
+
+
+class _LogStreamer:
+    """
+    Stream one run's pod log lines to HQ with cursor-based acknowledgement.
+
+    Each line is emitted with a per-run, zero-based ``seq``. HQ confirms how
+    many lines it persisted. Lines that were read but not confirmed form the
+    unconfirmed tail and are resent after socket or Kubernetes interruptions:
+
+    - a socket disconnect parks the stream in ``DISCONNECTED_RETRY`` until HQ
+      is reachable again; the same lines are then re-emitted
+    - a failed/untimed-out send enters ``SEND_FAILED_RETRY`` and retries the
+      same ``seq`` (HQ deduplicates)
+    - an interrupted Kubernetes watch enters ``K8S_WATCH_RETRY``; the pod log
+      is re-read from the start and already-confirmed lines are skipped
+
+    When HQ never acknowledges, the stream falls back once to ``LEGACY``
+    fire-and-forget mode. On node restart a streamer is started with the
+    cursor persisted at HQ (``Run.log_seq``), so streaming resumes after the
+    last confirmed line.
+    """
+
+    def __init__(
+        self,
+        manager: "ContainerManager",
+        run_id: int,
+        container_name: str,
+        task_id: int,
+        start_seq: int = 0,
+    ) -> None:
+        self._manager = manager
+        self.run_id = run_id
+        self.container_name = container_name
+        self.task_id = task_id
+        # number of lines already confirmed by HQ
+        self.acked_count = max(0, int(start_seq or 0))
+        # one beyond the highest seq assigned; the unconfirmed tail is
+        # range(acked_count, sent_count)
+        self.sent_count = self.acked_count
+        self.state = LogStreamState.STARTING
+        self.thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._finalized = False
+        self._legacy = False
+        self._consecutive_timeouts = 0
+        # cached total line counts of finished pods, keyed by pod name
+        self._pod_line_counts: dict[str, int] = {}
+        # timings are attributes so tests can override them
+        self.ack_timeout = LOG_STREAM_ACK_TIMEOUT_SECONDS
+        self.send_retry_seconds = LOG_STREAM_SEND_RETRY_SECONDS
+        self.watch_retry_seconds = LOG_STREAM_WATCH_RETRY_SECONDS
+        self.disconnect_poll_seconds = LOG_STREAM_DISCONNECT_POLL_SECONDS
+        self.no_pod_retries = LOG_STREAM_NO_POD_RETRIES
+        self.legacy_ack_timeouts = LOG_STREAM_LEGACY_ACK_TIMEOUTS
+
+    @property
+    def pending_count(self) -> int:
+        """Number of lines read but not yet confirmed by HQ."""
+        return max(0, self.sent_count - self.acked_count)
+
+    def stop(self, timeout: float | None = 10) -> None:
+        """Signal the stream to stop and wait for its thread to finish."""
+        self._stop_event.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=timeout)
+
+    def run(self) -> None:
+        """Follow the run's pod(s) and deliver every new log line to HQ."""
+        if not self._manager.share_algorithm_logs:
+            self._manager.log.info(
+                "Algorithm logs will not be shared with HQ for run %s because "
+                "share_algorithm_logs is disabled.",
+                self.run_id,
+            )
+            self.state = LogStreamState.STOPPED
+            return
+
+        pod_index = 0
+        # counts consecutive iterations that made no progress (pod absent, or
+        # all known pods already followed); reset whenever a pod is followed
+        idle_attempts = 0
+        while not self._stop_event.is_set() and not self._finalized:
+            pods = self._list_task_pods()
+            if not pods:
+                idle_attempts += 1
+                if idle_attempts > self.no_pod_retries:
+                    self._manager.log.warning(
+                        "Giving up log stream for run %s: task pod not found.",
+                        self.run_id,
+                    )
+                    self.state = LogStreamState.STOPPED
+                    return
+                self._set_state(
+                    LogStreamState.NO_POD_RETRY,
+                    "task pod not found, retrying",
+                )
+                if self._stop_event.wait(self.watch_retry_seconds):
+                    break
+                continue
+
+            if pod_index >= len(pods):
+                # All known pods have been followed to the end. A job-retry pod
+                # may be created shortly after a pod failed, so wait briefly for
+                # a new pod to appear before closing the stream.
+                idle_attempts += 1
+                if idle_attempts > self.no_pod_retries:
+                    self._manager.log.debug(
+                        "Log stream for run %s reached end of all pods", self.run_id
+                    )
+                    self.state = LogStreamState.STOPPED
+                    return
+                self._set_state(
+                    LogStreamState.ACTIVE,
+                    "all pods followed, waiting for a possible retry pod",
+                )
+                if self._stop_event.wait(self.watch_retry_seconds):
+                    break
+                # refresh the pod list in case a job-retry pod appeared
+                continue
+
+            target = pods[pod_index]
+            base_seq = self._base_seq_for(pods, pod_index)
+            try:
+                self._follow_pod(target, base_seq)
+            except _LogResendRequested as exc:
+                # HQ cursor may be behind lines of an earlier pod; restart from
+                # the pod that contains the requested seq.
+                self._set_state(
+                    LogStreamState.SEND_FAILED_RETRY,
+                    f"HQ requested resend from seq {exc.ack_seq}",
+                )
+                pod_index = self._pod_index_for_seq(pods, exc.ack_seq)
+                continue
+            pod_index += 1
+            idle_attempts = 0
+
+        self.state = (
+            LogStreamState.FINALIZED if self._finalized else LogStreamState.STOPPED
+        )
+
+    def _follow_pod(self, target: k8s_client.V1Pod, base_seq: int) -> None:
+        """Follow a single pod and deliver its lines; retry the watch on error."""
+        while not self._stop_event.is_set() and not self._finalized:
+            watcher = watch.Watch()
+            local_index = 0
+            try:
+                self._set_state(
+                    LogStreamState.ACTIVE, f"following {target.metadata.name}"
+                )
+                for line in watcher.stream(
+                    func=self._manager.core_api.read_namespaced_pod_log,
+                    name=target.metadata.name,
+                    namespace=self._manager.task_namespace,
+                    _request_timeout=(10, 300),
+                ):
+                    if self._stop_event.is_set() or self._finalized:
+                        break
+                    seq = base_seq + local_index
+                    local_index += 1
+                    self.sent_count = max(self.sent_count, seq + 1)
+                    self._deliver(seq, line)
+                # follow stream ended: the pod terminated, move to the next pod
+                return
+            except ApiException as exc:
+                if exc.status == 404:
+                    # pod disappeared while watching; continue with the next pod
+                    self._manager.log.info(
+                        "Pod %s for run %s disappeared while streaming logs",
+                        target.metadata.name,
+                        self.run_id,
+                    )
+                    return
+                self._set_state(
+                    LogStreamState.K8S_WATCH_RETRY,
+                    f"Kubernetes API error while reading logs: {exc}",
+                )
+                if self._stop_event.wait(self.watch_retry_seconds):
+                    return
+            except _LogResendRequested:
+                # handled by run(), which may restart from an earlier pod
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self._set_state(
+                    LogStreamState.K8S_WATCH_RETRY,
+                    f"Kubernetes log stream interrupted: {exc}",
+                )
+                if self._stop_event.wait(self.watch_retry_seconds):
+                    return
+            finally:
+                watcher.stop()
+
+    def _deliver(self, seq: int, line: str) -> None:
+        """
+        Deliver one line, retrying until HQ confirms it, the run is finalized,
+        or the stream is stopped.
+        """
+        if seq < self.acked_count:
+            # Already confirmed during a previous watch; never re-send.
+            return
+
+        payload = {
+            "collaboration_id": self._manager.client.collaboration_id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "log": line,
+            "seq": seq,
+        }
+
+        while not self._stop_event.is_set() and not self._finalized:
+            socket_io = self._manager.socket_io
+            if socket_io is None or not getattr(socket_io, "connected", False):
+                self._set_state(
+                    LogStreamState.DISCONNECTED_RETRY,
+                    f"socket to HQ down; {self.pending_count} unconfirmed line(s) "
+                    f"parked, waiting to reconnect (seq={seq})",
+                )
+                if self._stop_event.wait(self.disconnect_poll_seconds):
+                    return
+                continue
+
+            if self._legacy:
+                try:
+                    self._manager.socket_emit(
+                        "algorithm_log", payload, namespace="/tasks"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._set_state(
+                        LogStreamState.DISCONNECTED_RETRY,
+                        f"emit failed in legacy mode: {exc}",
+                    )
+                    if self._stop_event.wait(self.disconnect_poll_seconds):
+                        return
+                    continue
+                self.acked_count = max(self.acked_count, seq + 1)
+                return
+
+            ack_event = threading.Event()
+            ack_box: dict = {}
+
+            def _on_ack(response, box=ack_box, event=ack_event) -> None:
+                box["response"] = response
+                event.set()
+
+            try:
+                self._manager.socket_emit(
+                    "algorithm_log",
+                    payload,
+                    namespace="/tasks",
+                    callback=_on_ack,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not getattr(socket_io, "connected", False):
+                    self._set_state(
+                        LogStreamState.DISCONNECTED_RETRY,
+                        f"socket lost while sending seq={seq}: {exc}",
+                    )
+                    if self._stop_event.wait(self.disconnect_poll_seconds):
+                        return
+                else:
+                    self._set_state(
+                        LogStreamState.SEND_FAILED_RETRY,
+                        f"failed to send seq={seq}: {exc}",
+                    )
+                    if self._stop_event.wait(self.send_retry_seconds):
+                        return
+                continue
+
+            if ack_event.wait(self.ack_timeout):
+                self._consecutive_timeouts = 0
+                response = ack_box.get("response") or {}
+                status = response.get("status")
+                if status == "ok":
+                    self.acked_count = max(
+                        self.acked_count, int(response.get("ack_seq", seq + 1))
+                    )
+                    self._set_state(LogStreamState.ACTIVE, "acknowledged")
+                    return
+                if status == "finalized":
+                    self.acked_count = max(
+                        self.acked_count, int(response.get("ack_seq", seq))
+                    )
+                    self._finalized = True
+                    self._set_state(
+                        LogStreamState.FINALIZED,
+                        "run already finished at HQ",
+                    )
+                    return
+                if status == "resend":
+                    self.acked_count = int(response.get("ack_seq", 0))
+                    raise _LogResendRequested(self.acked_count)
+                # status "error" or anything unexpected: retry the send
+                self._set_state(
+                    LogStreamState.SEND_FAILED_RETRY,
+                    f"HQ rejected seq={seq}: {response}",
+                )
+                if self._stop_event.wait(self.send_retry_seconds):
+                    return
+                continue
+
+            # No acknowledgement in time.
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts >= self.legacy_ack_timeouts:
+                self._manager.log.warning(
+                    "HQ is not acknowledging log lines for run %s after %s "
+                    "timeouts; falling back to unacknowledged streaming",
+                    self.run_id,
+                    self._consecutive_timeouts,
+                )
+                self._legacy = True
+                self._set_state(
+                    LogStreamState.LEGACY,
+                    "HQ does not support log cursors",
+                )
+                continue
+            self._set_state(
+                LogStreamState.SEND_FAILED_RETRY,
+                f"no acknowledgement for seq={seq}, resending",
+            )
+            if self._stop_event.wait(self.send_retry_seconds):
+                return
+
+    def _list_task_pods(self) -> list[k8s_client.V1Pod]:
+        pods = self._manager.core_api.list_namespaced_pod(
+            namespace=self._manager.task_namespace,
+            label_selector=f"app={self.container_name}",
+        ).items
+        return sorted(
+            pods,
+            key=lambda p: (
+                str(p.metadata.creation_timestamp),
+                p.metadata.name,
+            ),
+        )
+
+    def _base_seq_for(self, pods: list[k8s_client.V1Pod], pod_index: int) -> int:
+        """
+        Compute the seq of the first line of ``pods[pod_index]``. It equals the
+        total number of lines in all earlier (finished) pods. Historical pod
+        logs never change, so this offset is stable across watch restarts.
+        """
+        base_seq = 0
+        for pod in pods[:pod_index]:
+            base_seq += self._pod_line_count(pod)
+        return base_seq
+
+    def _pod_index_for_seq(self, pods: list[k8s_client.V1Pod], seq: int) -> int:
+        """Return the index of the pod whose log contains ``seq``."""
+        boundary = 0
+        for index, pod in enumerate(pods):
+            boundary += self._pod_line_count(pod)
+            if seq < boundary:
+                return index
+        return len(pods) - 1
+
+    def _pod_line_count(self, pod: k8s_client.V1Pod) -> int:
+        name = pod.metadata.name
+        if name not in self._pod_line_counts:
+            text = self._manager.core_api.read_namespaced_pod_log(
+                name=name,
+                namespace=self._manager.task_namespace,
+                _preload_content=True,
+            )
+            self._pod_line_counts[name] = len(text.splitlines()) if text else 0
+        return self._pod_line_counts[name]
+
+    def _set_state(self, state: LogStreamState, detail: str = "") -> None:
+        if state == self.state:
+            return
+        self.state = state
+        message = (
+            f"Log stream for run {self.run_id}: state -> {state.value} ({detail})"
+            if detail
+            else f"Log stream for run {self.run_id}: state -> {state.value}"
+        )
+        if state in (
+            LogStreamState.ACTIVE,
+            LogStreamState.STARTING,
+            LogStreamState.STOPPED,
+            LogStreamState.FINALIZED,
+        ):
+            self._manager.log.info(message)
+        else:
+            self._manager.log.warning(message)
 
 
 class ContainerManager:
@@ -78,6 +498,14 @@ class ContainerManager:
         self.client = client
         self.socket_io = None
         self.num_active_tasks = 0
+
+        # Active algorithm log streams keyed by run_id. Each value is the
+        # _LogStreamer that owns the streaming thread.
+        self._log_streamers: dict[int, _LogStreamer] = {}
+        self._log_streamers_lock = threading.Lock()
+        # python-socketio's emit is not thread-safe; one run stream per task
+        # may exist, so all log emits share this lock while composing packets.
+        self._socket_emit_lock = threading.Lock()
 
         # When a pod runs in Kubernetes with a ServiceAccount, Kubernetes automatically
         # mounts the service account credentials at
@@ -121,6 +549,19 @@ class ContainerManager:
         Set the socketIO object.
         """
         self.socket_io = socket_io
+
+    def socket_emit(
+        self, event: str, data: dict, namespace: str, callback=None
+    ) -> None:
+        """
+        Emit a socket event, serializing concurrent emits from the log stream
+        threads because python-socketio's ``emit`` is not thread-safe.
+        """
+        with self._socket_emit_lock:
+            if callback is None:
+                self.socket_io.emit(event, data, namespace=namespace)
+            else:
+                self.socket_io.emit(event, data, namespace=namespace, callback=callback)
 
     def ensure_task_namespace(self) -> bool:
         """
@@ -684,9 +1125,9 @@ class ContainerManager:
             return None
         return secret
 
-    def _stream_logs(self, run_io: RunIO, task_id: int) -> None:
+    def _stream_logs(self, run_io: RunIO, task_id: int, start_seq: int = 0) -> None:
         """
-        Stream logs to HQ.
+        Start streaming a run's logs to HQ in a background thread.
 
         Parameters
         ----------
@@ -694,60 +1135,96 @@ class ContainerManager:
             RunIO object that contains information about the run
         task_id: int
             Task ID
+        start_seq: int
+            Number of log lines already confirmed by HQ (0 for new runs)
         """
-        self.log.info(f"Starting thread to stream logs for run {run_io.run_id}")
-        thread = threading.Thread(target=self.__log_stream, args=(run_io, task_id))
-        thread.start()
+        self._start_log_stream(
+            run_id=run_io.run_id,
+            container_name=run_io.container_name,
+            task_id=task_id,
+            start_seq=start_seq,
+        )
 
-    def __log_stream(self, run_io: RunIO, task_id: int) -> None:
+    def _start_log_stream(
+        self, run_id: int, container_name: str, task_id: int, start_seq: int = 0
+    ) -> None:
         """
-        Stream logs to HQ.
-
-        Parameters
-        ----------
-        run_io: RunIO
-            RunIO object that contains information about the run
-        task_id: int
-            Task ID
+        Create and start a cursor-aware log stream for a run. No second stream
+        is started when one is already active for the same run.
         """
         if not self.share_algorithm_logs:
             self.log.info(
                 "Algorithm logs will not be shared with HQ for run %s because "
                 "share_algorithm_logs is disabled.",
-                run_io.run_id,
+                run_id,
             )
             return
-
-        w = watch.Watch()
-        try:
-            pod_list = self.core_api.list_namespaced_pod(
-                namespace=self.task_namespace,
-                label_selector=f"app={run_io.container_name}",
-            ).items
-            if not len(pod_list):
-                self.log.error(f"No POD found for run {run_io.run_id}")
+        with self._log_streamers_lock:
+            if run_id in self._log_streamers:
+                self.log.debug("Log stream for run %s is already active", run_id)
                 return
+            streamer = _LogStreamer(
+                manager=self,
+                run_id=run_id,
+                container_name=container_name,
+                task_id=task_id,
+                start_seq=start_seq,
+            )
+            self._log_streamers[run_id] = streamer
 
-            pod = pod_list[0]
-            for log_line in w.stream(
-                func=self.core_api.read_namespaced_pod_log,
-                name=pod.metadata.name,
-                namespace=self.task_namespace,
-            ):
-                self.socket_io.emit(
-                    "algorithm_log",
-                    {
-                        "collaboration_id": self.client.collaboration_id,
-                        "run_id": run_io.run_id,
-                        "task_id": task_id,
-                        "log": log_line,
-                    },
-                    namespace="/tasks",
-                )
-        except Exception as e:  # noqa: BLE001
-            self.log.error(f"Error while streaming logs for run {run_io.run_id}: {e}")
+        self.log.info("Starting thread to stream logs for run %s", run_id)
+        thread = threading.Thread(
+            target=self._run_log_stream,
+            args=(streamer,),
+            daemon=True,
+            name=f"log-stream-run-{run_id}",
+        )
+        streamer.thread = thread
+        thread.start()
+
+    def _run_log_stream(self, streamer: _LogStreamer) -> None:
+        """Run a log streamer to completion and unregister it afterwards."""
+        try:
+            streamer.run()
+        except Exception:
+            self.log.exception("Error while streaming logs for run %s", streamer.run_id)
         finally:
-            w.stop()
+            with self._log_streamers_lock:
+                self._log_streamers.pop(streamer.run_id, None)
+
+    def reattach_log_stream(
+        self, run_id: int, task_id: int, start_seq: int = 0
+    ) -> None:
+        """
+        Re-attach a log stream to a run whose pod is already running, e.g.
+        after a node restart. ``start_seq`` is the cursor persisted at HQ so
+        that only the unconfirmed tail is re-sent.
+        """
+        self._start_log_stream(
+            run_id=run_id,
+            container_name=f"{APPNAME}-run-{run_id}",
+            task_id=task_id,
+            start_seq=start_seq,
+        )
+
+    def stop_log_stream(self, run_id: int, timeout: float | None = 10) -> None:
+        """
+        Stop a run's log stream and wait for its thread to finish. This must
+        happen before the complete run log is collected and sent to HQ.
+        """
+        with self._log_streamers_lock:
+            streamer = self._log_streamers.get(run_id)
+        if streamer is not None:
+            self.log.info("Stopping log stream for run %s", run_id)
+            streamer.stop(timeout=timeout)
+
+    def get_log_stream_states(self) -> dict[int, str]:
+        """Return the observable state of each active log stream by run id."""
+        with self._log_streamers_lock:
+            return {
+                run_id: streamer.state.value
+                for run_id, streamer in self._log_streamers.items()
+            }
 
     def __wait_until_pod_running(self, run_io: RunIO, label: str) -> RunStatus:
         """"
@@ -1516,6 +1993,9 @@ class ContainerManager:
                     else (b"", RunStatus.CRASHED)
                 )
 
+                # Stop the live log stream before collecting the complete log,
+                # so no late line can race with the final log delivered to HQ.
+                self.stop_log_stream(run_io.run_id)
                 logs = self._get_logs(run_io)
 
                 self.log.info(
@@ -1807,6 +2287,7 @@ class ContainerManager:
             self.client,
             task_dir_extension=self.ctx.config.get("dev", {}).get("task_dir_extension"),
         )
+        self.stop_log_stream(run_io.run_id)
         logs = self._get_logs(run_io)
         if initiator == KillInitiator.USER:
             logs += "\n\nAlgorithm was killed by user request."

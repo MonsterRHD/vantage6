@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 断线进入可观察重试结果可观察
+  - id: 2
+    type: f2p
+    text: 确认行不重复结果可观察明确
+  - id: 3
+    type: f2p
+    text: 未确认尾部补发结果可观察
+  - id: 4
+    type: f2p
+    text: HQ 接收持久化后确认结果可观察
+  - id: 5
+    type: f2p
+    text: 任务结束日志完整可读结果可观察
+  - id: 6
+    type: p2p
+    text: 节点重启从确认点继续结果可观察
+  - id: 7
+    type: p2p
+    text: 空日志与旧事件兼容结果可观察

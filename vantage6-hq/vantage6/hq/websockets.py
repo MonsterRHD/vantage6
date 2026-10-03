@@ -487,15 +487,32 @@ class DefaultSocketNamespace(Namespace):
                 room=room,
             )
 
-    def on_algorithm_log(self, data: dict) -> None:
+    def on_algorithm_log(self, data: dict) -> dict | None:
         """
         Handle log messages from algorithm containers and log them in the HQ logs.
+
+        Newer nodes send a per-run, zero-based line sequence number (``seq``).
+        HQ persists a confirmation cursor (``Run.log_seq``) and acknowledges
+        every event, so that:
+
+        - lines with ``seq < log_seq`` are duplicates and are not stored or
+          broadcast again
+        - lines with ``seq == log_seq`` are appended and advance the cursor
+        - lines with ``seq > log_seq`` leave a gap; the node is told to resend
+          from the last confirmed position
+        - events arriving after the run finished (its complete log was already
+          PATCHed) are discarded but acknowledged
+
+        Nodes running an older version send no ``seq``; those events are
+        appended exactly as before. The broadcast to users keeps its original
+        shape (``seq`` is added only when present), so older UI clients remain
+        compatible.
 
         Parameters
         ----------
         data: Dict
-            Dictionary containing log message details.
-            It should look as follows:
+            Dictionary containing log message details. It should look as
+            follows (``seq`` is only sent by newer nodes):
 
             .. code:: python
 
@@ -503,8 +520,17 @@ class DefaultSocketNamespace(Namespace):
                     "collaboration_id": 1,
                     "run_id": 1,
                     "task_id": 1,
-                    "log": "Log message"
+                    "log": "Log message",
+                    "seq": 0
                 }
+
+        Returns
+        -------
+        dict | None
+            Acknowledgement for nodes that request one: ``{"status": "ok",
+            "ack_seq": n}``, ``{"status": "resend", "ack_seq": n}`` when a gap
+            is detected, or ``{"status": "finalized", ...}`` when the run is
+            already finished.
         """
         if not self._is_node():
             return
@@ -513,19 +539,77 @@ class DefaultSocketNamespace(Namespace):
         run_id = data.get("run_id")
         task_id = data.get("task_id")
         log_message = data.get("log")
+        seq = data.get("seq")
 
         run = db.Run.get(run_id)
-        self._append_log(log_message, run)
-        run.save()
+        if run is None:
+            self.log.warning(
+                "Received algorithm log for unknown run_id=%s", run_id
+            )
+            return {"status": "error", "reason": "unknown_run"}
 
-        # emit the log to the collaboration room so that the UI can display it
-        emit(
-            "algorithm_log",
-            {"run_id": run_id, "task_id": task_id, "log": log_message},
-            room=f"collaboration_{collaboration_id}",
-        )
+        # The complete log is delivered via REST PATCH when the run finishes.
+        # Late live-stream lines must neither duplicate nor overwrite it.
+        if run.finished_at is not None:
+            return {"status": "finalized", "ack_seq": run.log_seq or 0}
 
-    def _append_log(self, log_message, run):
+        try:
+            if seq is None:
+                # Legacy node: no cursor available, keep the historical behaviour.
+                self._append_log(log_message, run)
+                run.save()
+                emit(
+                    "algorithm_log",
+                    {"run_id": run_id, "task_id": task_id, "log": log_message},
+                    room=f"collaboration_{collaboration_id}",
+                )
+                return {"status": "ok"}
+
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+                return {"status": "error", "reason": "invalid_seq"}
+
+            expected_seq = run.log_seq or 0
+            if seq < expected_seq:
+                # The line was already persisted; do not duplicate it. Still
+                # acknowledge so the node can drop the line from its retry tail.
+                return {"status": "ok", "ack_seq": expected_seq}
+            if seq > expected_seq:
+                # A line is missing. Ask the node to resend the unconfirmed
+                # tail starting at the last confirmed position.
+                self.log.warning(
+                    "Gap in algorithm log stream for run_id=%s: received seq=%s "
+                    "but expected seq=%s; requesting resend",
+                    run_id,
+                    seq,
+                    expected_seq,
+                )
+                return {"status": "resend", "ack_seq": expected_seq}
+
+            if log_message:
+                self._append_log(log_message, run)
+            run.log_seq = expected_seq + 1
+            run.save()
+
+            # emit the log to the collaboration room so that the UI can display it
+            emit(
+                "algorithm_log",
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "log": log_message,
+                    "seq": seq,
+                },
+                room=f"collaboration_{collaboration_id}",
+            )
+            return {"status": "ok", "ack_seq": expected_seq + 1}
+        except Exception:
+            self.log.exception(
+                "Failed to persist algorithm log for run_id=%s", run_id
+            )
+            return {"status": "error", "reason": "persist_failed"}
+
+    @staticmethod
+    def _append_log(log_message: str, run) -> None:
         if run.log:
             if not run.log.endswith("\n"):
                 run.log += "\n"

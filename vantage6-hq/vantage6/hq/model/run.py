@@ -47,6 +47,9 @@ class Run(Base):
         Status of the task
     log : str
         Log of the task
+    log_seq : int
+        Number of live log lines that have been confirmed for this run. Nodes
+        use this as the acknowledgement cursor when streaming logs.
     action : :class:`.~vantage6.common.AlgorithmStepType`
         Action type of the task
     blob_storage_used : bool
@@ -71,6 +74,7 @@ class Run(Base):
     finished_at = Column(DateTime)
     status = Column(Text)
     log = Column(Text)
+    log_seq = Column(Integer, nullable=False, default=0, server_default="0")
     action = Column(Text)
     cleanup_at = Column(DateTime, nullable=True)
     blob_storage_used = Column(
